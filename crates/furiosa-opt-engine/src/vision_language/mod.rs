@@ -9,6 +9,7 @@
 //!   order, a view of its launch's rows, once the device accepted the launches.
 
 mod gemma4_unified;
+pub mod qwen3_asr;
 
 use crate::decoder::{HbmTensor, Rows};
 use furiosa_opt_std::prelude::{Device, HbmBuffer, M, bf16};

@@ -24,6 +24,8 @@ use crate::models::decoder::attention::{Geometry, qwen3};
 use crate::models::{Class, Family, Implements};
 use crate::specialize::attention::Decode;
 
+pub mod audio;
+
 /// HF `Qwen3ASRForConditionalGeneration` without its audio tower, of the Qwen3 size `S`: the text
 /// model, then its greedy head over the token table.
 pub type ForConditionalGeneration<S, P, Q, C, X> =

@@ -697,15 +697,18 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
     ("Qwen2_5_VLForConditionalGeneration", &[]),
     (
         "Qwen3ASRForConditionalGeneration",
-        &[Implementation::of::<
-            qwen3_asr::ForConditionalGeneration<
-                qwen3::Size<"1.7B">,
-                form::Affine,
-                Parallel<1>,
-                cache::Bf16,
-                Hbm,
-            >,
-        >()],
+        &[
+            Implementation::of::<
+                qwen3_asr::ForConditionalGeneration<
+                    qwen3::Size<"1.7B">,
+                    form::Affine,
+                    Parallel<1>,
+                    cache::Bf16,
+                    Hbm,
+                >,
+            >(),
+            Implementation::of::<qwen3_asr::audio::Tower>(),
+        ],
     ),
     ("Qwen3ASRForcedAlignerForTokenClassification", &[]),
     ("Qwen3ASRRealtimeGeneration", &[]),
