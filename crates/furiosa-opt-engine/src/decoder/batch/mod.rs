@@ -15,7 +15,7 @@ pub use compact::Table;
 pub use staging::Staged;
 
 use super::{Binding, Cache, Group, Keep, Kind, Limits, Request};
-use furiosa_opt_models::ops::index::table::FIELDS;
+use furiosa_opt_models::ops::index::{copy, table::FIELDS};
 use furiosa_opt_std::prelude::*;
 use std::{collections::HashSet, io, marker::PhantomData, ops::Range};
 
@@ -91,6 +91,8 @@ pub struct Batch<'a, A> {
     kept: Vec<usize>,
     /// The call's adapters bound to its slots and rows; none when no row runs with one.
     adapters: Option<Binding<'a, A>>,
+    /// Each override: its request, the call rows it replaces and its BF16 rows.
+    overrides: Vec<(usize, Range<usize>, HbmBuffer)>,
 }
 
 impl<'a, A> Batch<'a, A> {
@@ -146,10 +148,13 @@ impl<'a, A> Batch<'a, A> {
             if request.mask.is_some() {
                 return Some(unsupported("visibility masks are not served"));
             }
-            if !request.overrides.is_empty() {
+            if !request.overrides.is_empty() && limits.overrides == 0 {
                 return Some(unsupported("row overrides are not served"));
             }
             let len = request.tokens.len();
+            if let Some(error) = overridden(request, limits.overrides).err() {
+                return Some(error);
+            }
             let end = request.cached.saturating_add(len);
             if request.rows.len() != blocks.len() {
                 return Some(invalid("request holds a block list for each cache group"));
@@ -234,6 +239,17 @@ impl<'a, A> Batch<'a, A> {
             ))
         });
         let (compact, appended) = groups.collect::<io::Result<Vec<_>>>()?.into_iter().unzip();
+        let mut overrides = Vec::new();
+        for (index, (request, span)) in requests.iter().zip(&spans).enumerate() {
+            for (rows, (_, values)) in overridden(request, limits.overrides)?
+                .into_iter()
+                .zip(&request.overrides)
+            {
+                let call = span.start + rows.start..span.start + rows.end;
+                let values = values.alias(..).map_err(io::Error::other)?;
+                overrides.push((index, call, values));
+            }
+        }
         Ok(Self {
             compact,
             appended,
@@ -242,7 +258,98 @@ impl<'a, A> Batch<'a, A> {
                 .collect(),
             kept,
             adapters: Binding::new(adapters, slots),
+            overrides,
         })
+    }
+
+    /// The call with its override rows placed in `table`, a token table's storage of rows of
+    /// `bytes` each, from row `first` on, call row `r` at row `first + r`; each overridden row's
+    /// token ID names its table row, in a copy of its request's IDs. The rows of the table from
+    /// `first` on hold no token: no other row reads them.
+    pub async fn place(
+        mut self,
+        device: &mut Device,
+        table: &HbmBuffer,
+        (first, bytes): (usize, usize),
+    ) -> io::Result<Self> {
+        let other = io::Error::other;
+        let word = Rows::<i32, m![1]>::bytes();
+        let mut requests: Vec<usize> = self.overrides.iter().map(|(at, ..)| *at).collect();
+        requests.dedup();
+        for request in requests {
+            let (ids, span) = &self.tokens[request];
+            let (count, start) = (ids.len(), span.start);
+            let copied = HbmBuffer::alloc(device, ids.buffer().size()).map_err(other)?;
+            let mut whole = copied.alias(..).map_err(other)?;
+            copy(&mut *device, [(ids.buffer(), &mut whole)])?;
+            for (_, rows, values) in self.overrides.iter().filter(|(at, ..)| *at == request) {
+                let named: Vec<u8> = (rows.clone())
+                    .flat_map(|row| ((first + row) as i32).to_le_bytes())
+                    .collect();
+                let named = HostBufferSlice::from(&named[..])
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .map_err(other)?;
+                let local = rows.start - start..rows.end - start;
+                let mut target =
+                    (copied.alias(local.start * word..local.end * word)).map_err(other)?;
+                let mut placed = (table
+                    .alias((first + rows.start) * bytes..(first + rows.end) * bytes))
+                .map_err(other)?;
+                copy(&mut *device, [(&named, &mut target), (values, &mut placed)])?;
+            }
+            self.tokens[request].0 = Rows::new(&copied, 0..count)?;
+        }
+        Ok(self)
+    }
+
+    /// The call with every row's token ID naming its own row of a token table, call row `r` row
+    /// `first + r`, in a copy of each request's IDs: the caller writes those rows.
+    pub async fn named(mut self, device: &mut Device, first: usize) -> io::Result<Self> {
+        for (ids, span) in &mut self.tokens {
+            let named: Vec<u8> = (span.clone())
+                .flat_map(|row| ((first + row) as i32).to_le_bytes())
+                .collect();
+            let named = HostBufferSlice::from(&named[..])
+                .to_hbm(&mut device.pdma)
+                .await
+                .map_err(io::Error::other)?;
+            *ids = Rows::new(&named, 0..span.len())?;
+        }
+        Ok(self)
+    }
+
+    /// Each call row's position in its sequence, in call row order.
+    pub fn positions(&self) -> Vec<usize> {
+        let mut positions = vec![
+            0;
+            self.tokens
+                .iter()
+                .map(|(_, span)| span.end)
+                .max()
+                .unwrap_or(0)
+        ];
+        for appended in &self.appended[0] {
+            for (at, row) in appended.rows.clone().enumerate() {
+                positions[row] = appended.cached + at;
+            }
+        }
+        positions
+    }
+
+    /// The token ID of call row `row`, a view of its request's IDs.
+    pub fn token(&self, row: usize) -> io::Result<HbmBuffer> {
+        let (ids, span) = (self.tokens.iter())
+            .find(|(_, span)| span.contains(&row))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no such call row"))?;
+        let word = Rows::<i32, m![1]>::bytes();
+        let at = row - span.start;
+        (ids.buffer().alias(at * word..(at + 1) * word)).map_err(io::Error::other)
+    }
+
+    /// Each override's call rows and BF16 rows, in request order.
+    pub fn overrides(&self) -> impl Iterator<Item = (Range<usize>, &HbmBuffer)> {
+        (self.overrides.iter()).map(|(_, rows, values)| (rows.clone(), values))
     }
 
     /// The call rows the call returns, in order.
@@ -260,6 +367,33 @@ impl<'a, A> Batch<'a, A> {
     pub fn row_segments(&self, group: usize) -> (Vec<[i32; FIELDS]>, &[i32]) {
         self.compact[group].row_segments()
     }
+}
+
+/// The request rows each of `request`'s overrides replaces, in order, its values `width` BF16
+/// features a row; refuses an override that holds no whole row, reaches past the appended rows or
+/// overlaps another.
+fn overridden(request: &Request, width: usize) -> io::Result<Vec<Range<usize>>> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+    let row = Rows::<bf16, m![1]>::bytes() * width;
+    let mut spans: Vec<Range<usize>> = Vec::with_capacity(request.overrides.len());
+    for (offset, values) in &request.overrides {
+        let size = values.size();
+        if size == 0 || size % row != 0 {
+            return Err(invalid("an override holds no whole number of rows"));
+        }
+        let rows = *offset..offset.saturating_add(size / row);
+        if rows.end > request.tokens.len() {
+            return Err(invalid("an override reaches past the appended rows"));
+        }
+        if spans
+            .iter()
+            .any(|span| span.start < rows.end && rows.start < span.end)
+        {
+            return Err(invalid("two overrides replace one row"));
+        }
+        spans.push(rows);
+    }
+    Ok(spans)
 }
 
 /// The call rows of requests of `lens` appended rows: the one-row requests' from row 0, then the
@@ -296,6 +430,7 @@ mod tests {
                 }],
             },
             adapters: 0,
+            overrides: 0,
         }
     }
 
@@ -423,6 +558,58 @@ mod tests {
         ];
         let kept = [0, 3, 4, 6, 7];
         assert_eq!(plan(&requests, &limits, &cache)?.kept(), kept);
+        Ok(())
+    }
+
+    /// A decoder that takes override rows plans whole rows within a request's appended rows at
+    /// their call rows, and refuses a partial row, a span past the appended rows and two spans of
+    /// one row, each as invalid input with its own message.
+    #[test]
+    fn plans_override_rows() -> io::Result<()> {
+        let device = device()?;
+        let limits = Limits {
+            overrides: 4,
+            ..limits(16)
+        };
+        let cache = Cache::new(&device, &limits.cache, 8)?;
+        let rows =
+            |count: usize| HbmBuffer::alloc(&device, count * 4 * 2).map_err(io::Error::other);
+        let overriding = |cached, count, overrides| -> io::Result<Request> {
+            Ok(Request {
+                overrides,
+                ..request(&device, &[cached as u32], 0, count)?
+            })
+        };
+        let requests = [
+            overriding(0, 1, vec![(0, rows(1)?)])?,
+            overriding(1, 4, vec![(0, rows(1)?), (2, rows(2)?)])?,
+        ];
+        let planned = plan(&requests, &limits, &cache)?;
+        let spans: Vec<(usize, Range<usize>)> = (planned.overrides.iter())
+            .map(|(request, rows, _)| (*request, rows.clone()))
+            .collect();
+        assert_eq!(spans, [(0, 0..1), (1, 1..2), (1, 3..5)]);
+        let partial = HbmBuffer::alloc(&device, 4).map_err(io::Error::other)?;
+        for (overrides, message) in [
+            (
+                vec![(0, partial)],
+                "an override holds no whole number of rows",
+            ),
+            (
+                vec![(1, rows(2)?)],
+                "an override reaches past the appended rows",
+            ),
+            (
+                vec![(0, rows(2)?), (1, rows(1)?)],
+                "two overrides replace one row",
+            ),
+        ] {
+            let error = plan(&[overriding(0, 2, overrides)?], &limits, &cache)
+                .err()
+                .expect(message);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{message}");
+            assert_eq!(error.to_string(), message);
+        }
         Ok(())
     }
 

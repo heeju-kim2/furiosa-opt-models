@@ -11,6 +11,7 @@ use mllama::CrossLanguage;
 pub mod gemma4_unified;
 pub mod llava;
 pub mod mllama;
+pub mod qwen3_asr;
 pub mod qwen3_vl;
 
 /// Source: Transformers `src/transformers/models/emu3/modeling_emu3.py`.

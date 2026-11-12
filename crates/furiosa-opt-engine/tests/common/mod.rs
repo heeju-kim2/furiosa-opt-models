@@ -41,6 +41,11 @@ impl Published {
         }
     }
 
+    /// The repository and the commit, as the hub's tools name them.
+    pub const fn hub(&self) -> (&'static str, &'static str) {
+        (self.repo, self.revision)
+    }
+
     /// The folder `folder` of this repository, as a pipeline holds a component.
     pub const fn folder(self, folder: &'static str) -> Self {
         Self { folder, ..self }

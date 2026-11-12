@@ -310,6 +310,26 @@ impl Checkpoint {
         Ok(())
     }
 
+    /// The same tensors and config with the tensor `name` added, as `insert` adds it: a load of a
+    /// tree that names a tensor its checkpoint does not store reads the added one.
+    pub fn with(
+        &self,
+        name: &str,
+        dtype: Dtype,
+        shape: &[usize],
+        data: Vec<u8>,
+    ) -> Result<Self, LoadError> {
+        let mut extended = Self {
+            config: self.config.clone(),
+            tensors: self.tensors.clone(),
+            directory: self.directory.clone(),
+            quantization: self.quantization,
+            part: self.part,
+        };
+        extended.insert(name, dtype, shape, data)?;
+        Ok(extended)
+    }
+
     /// Removes the tensor `name`; whether the checkpoint held it.
     #[cfg(any(test, feature = "test-support"))]
     pub fn remove(&mut self, name: &str) -> bool {

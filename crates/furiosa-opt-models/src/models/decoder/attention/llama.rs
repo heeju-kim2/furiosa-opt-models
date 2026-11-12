@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use super::qwen3::{self, Front};
 use super::{Geometry, Head, KvHeads};
+use crate::load::Named;
 use crate::models::{Family, config};
 use crate::ops::attention::geometry::{self, HeadRows, ProjectionWidth, QueryGroups, QueryWidth};
 use crate::ops::normalization::RmsNorm;
@@ -115,6 +116,7 @@ impl Decode for Size<"Mistral-7B"> {
 impl<const N: &'static str> Front for Size<N> {
     type Heads<Projection, Norm> = Projection;
     type HeadNorm<Norm> = ();
+    type Table<Table> = Named<"embed_tokens", Table>;
 }
 
 /// What a Llama checkpoint's config declares that its size fixes, and the features the sizes do

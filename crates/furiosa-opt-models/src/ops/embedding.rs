@@ -58,6 +58,22 @@ impl<Vocabulary: AxisName, Hidden: AxisName, Chips: M, Parameter>
 pub type Table<'a, Vocabulary, Hidden, Chips> =
     dyn Fn() -> Result<HostTensor<bf16, m![{ Chips }, { m![Vocabulary, Hidden] }]>, LoadError> + 'a;
 
+impl<Vocabulary: AxisName, Hidden: AxisName, Chips: M, Rows: M>
+    Embedding<Vocabulary, Hidden, Chips, HbmTensor<bf16, Chips, Rows>>
+{
+    /// The table, and a second owner of its storage, every chip's rows of `Hidden` BF16 features
+    /// one after another: a caller writes through it the rows past the checkpoint's tokens.
+    pub fn shared(self) -> Result<(Self, HbmBuffer), furiosa_opt_std::Error> {
+        let buffer = self.weight.into_buffer();
+        let owner = buffer.alias(..)?;
+        let table = Self {
+            weight: HbmTensor::try_from(buffer)?,
+            features: PhantomData,
+        };
+        Ok((table, owner))
+    }
+}
+
 impl<Vocabulary: AxisName, Hidden: AxisName, Chips: M> Embedding<Vocabulary, Hidden, Chips> {
     /// The config's `vocab_size`: the tokens a table holds, at most `Vocabulary`.
     pub fn tokens(source: &Checkpoint, context: &mut Context<'_>) -> Result<usize, LoadError> {

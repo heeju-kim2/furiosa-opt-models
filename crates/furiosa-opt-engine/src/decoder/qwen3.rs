@@ -17,27 +17,33 @@
 //!   key and value rows out head-major, and a channel-scaled projection adds no update.
 
 use super::adapters::{self, SLOTS};
-use super::{Batch, CacheSpec, Decoder, Group, Kind, Limits, Output, Pool, Rows, Table};
+use super::{Batch, CacheSpec, Decoder, Group, Instance, Kind, Limits, Output, Pool, Rows, Table};
 use crate::{AsyncModule, Checkpoint, Function, LoadError, forward};
-use furiosa_opt_models::Module;
-use furiosa_opt_models::load::{Context, Load};
+use furiosa_opt_models::load::{Context, Load, Named, Part};
 use furiosa_opt_models::models::decoder::attention::qwen3::{fp8, launch};
 use furiosa_opt_models::models::decoder::attention::{Chunks, Head, KvHeads};
-use furiosa_opt_models::models::decoder::attention::{Geometry, llama, qwen3};
+use furiosa_opt_models::models::decoder::attention::{Geometry, llama, qwen3, qwen3_tts};
 use furiosa_opt_models::models::decoder::form;
+use furiosa_opt_models::models::vision_language::qwen3_asr;
 use furiosa_opt_models::modules::attention::key_value;
-use furiosa_opt_models::modules::language::{Input, Selected};
+use furiosa_opt_models::modules::language::{Backbone, Input, Selected};
 use furiosa_opt_models::modules::lora::{self, Adapters, Rank};
 use furiosa_opt_models::ops::attention::full::paged::{Tiling, chunks::Masks};
 use furiosa_opt_models::ops::attention::gqa::Cache as Window;
 use furiosa_opt_models::ops::embedding::Ids;
-use furiosa_opt_models::ops::index::gather;
+use furiosa_opt_models::ops::index::copy as ops_copy;
+use furiosa_opt_models::ops::index::gather::{self, Gather};
 use furiosa_opt_models::ops::index::table::BlockIndex;
+use furiosa_opt_models::ops::index::table::ByteOffset;
+use furiosa_opt_models::ops::linear::Affine;
 use furiosa_opt_models::ops::linear::affine::{self, Columns};
 use furiosa_opt_models::specialize::attention::{Decode, WAVES};
-use furiosa_opt_models::tensor::cache::{self, Block, Blocks};
+use furiosa_opt_models::tensor::axis;
+use furiosa_opt_models::tensor::cache::{self, Block as CacheBlock, Blocks};
+use furiosa_opt_models::tensor::mapping::Packets;
 use furiosa_opt_models::tensor::memory::{Hbm, alias};
 use furiosa_opt_models::tensor::parallel::{Chip, Parallel};
+use furiosa_opt_models::{Module, Then};
 use furiosa_opt_std::prelude::*;
 use furiosa_opt_std::runtime::DeviceOutput;
 use std::{convert::Infallible, io, marker::PhantomData};
@@ -60,7 +66,7 @@ fn limits<S: Geometry + Decode>(adapters: usize) -> Limits {
         rows: S::Rows::SIZE,
         cache: CacheSpec {
             pools: vec![Pool {
-                block: Block::SIZE,
+                block: CacheBlock::SIZE,
                 bytes: Blocks::<KvHeads, Head>::BLOCK_STRIDE as usize,
             }],
             groups: vec![Group {
@@ -71,6 +77,7 @@ fn limits<S: Geometry + Decode>(adapters: usize) -> Limits {
             }],
         },
         adapters,
+        overrides: 0,
     }
 }
 
@@ -105,6 +112,29 @@ fn keep<W: AxisName>(
     let pairs = pairs.iter_mut().map(|(from, to)| (&*from, to));
     furiosa_opt_models::ops::index::copy(&mut *device, pairs)?;
     Rows::new(&target, 0..kept.len())
+}
+
+/// The kept rows' greedy tokens of a Qwen3 head over `kept`, the rows of the size `$size`'s base
+/// model.
+macro_rules! greedy {
+    ($size:ty, $head:expr, $device:ident, $kept:ident) => {{
+        type Size = $size;
+        type W = <Size as Geometry>::Hidden;
+        if $kept.len() == 0 {
+            return Rows::new($kept.buffer(), 0..0);
+        }
+        let head: qwen3::LmHead<Size, &Hbm> =
+            Load::load(&mut Context::new(None), $head).map_err(io::Error::other)?;
+        let bytes = Rows::<bf16, Symbol<W>>::bytes();
+        let views: gather::RowStorage<W, bf16> = (0..$kept.len())
+            .map(|row| alias($kept.buffer(), row * bytes..(row + 1) * bytes))
+            .collect::<io::Result<_>>()?;
+        let mut rows =
+            gather::Rows::<bf16, W, <Size as Decode>::Rows>::new($device, &views).await?;
+        let head = Function::new(&head, forward);
+        let tokens = head.forward($device, (), &mut (), &mut rows).await?;
+        Rows::new(&tokens.into_buffer(), 0..$kept.len())
+    }};
 }
 
 /// The decoders of the listed sizes `$size` whose projections hold form `$form`: the base model
@@ -199,23 +229,8 @@ macro_rules! decoders {
                 batch: Batch<'_, Self::Adapter>,
                 tiling: Tiling,
             ) -> io::Result<Rows<i32, m![1]>> {
-                type Size = $size;
-                type W = <Size as Geometry>::Hidden;
                 let kept = self.model.call(device, layers, batch, tiling).await?;
-                if kept.len() == 0 {
-                    return Rows::new(kept.buffer(), 0..0);
-                }
-                let head: qwen3::LmHead<Size, &Hbm> =
-                    Load::load(&mut Context::new(None), &self.lm_head).map_err(io::Error::other)?;
-                let bytes = Rows::<bf16, Symbol<W>>::bytes();
-                let views: gather::RowStorage<W, bf16> = (0..kept.len())
-                    .map(|row| alias(kept.buffer(), row * bytes..(row + 1) * bytes))
-                    .collect::<io::Result<_>>()?;
-                let mut rows = gather::Rows::<bf16, W, <Size as Decode>::Rows>::new(device, &views)
-                    .await?;
-                let head = Function::new(&head, forward);
-                let tokens = head.forward(device, (), &mut (), &mut rows).await?;
-                Rows::new(&tokens.into_buffer(), 0..kept.len())
+                greedy!($size, &self.lm_head, device, kept)
             }
         }
     )+};
@@ -296,12 +311,320 @@ decoders!(
     (qwen3::Size<"1.7B">, form::Affine) => adapted,
     (qwen3::Size<"4B">, form::Affine) => adapted,
     (qwen3::Size<"8B">, form::Affine) => normalized,
+    (qwen3_tts::Talker<"1.7B">, form::Affine) => normalized,
+    (qwen3_tts::Predictor<"1.7B">, form::Affine) => normalized,
     (llama::Size<"8B">, form::Affine) => projected,
     (llama::Size<"Mistral-7B">, form::Affine) => projected,
     (qwen3::Size<"0.6B">, form::ChannelScaled) => normalized,
     (qwen3::Size<"1.7B">, form::ChannelScaled) => normalized,
     (qwen3::Size<"4B">, form::ChannelScaled) => normalized,
 );
+
+/// A conditional decoder whose calls take override rows: the decoder, and a second owner of its
+/// token table's storage, whose rows past the checkpoint's tokens each call's override rows fill.
+pub struct Overriding<D> {
+    decoder: D,
+    table: HbmBuffer,
+}
+
+/// The decoders of the listed conditional checkpoints `$model` of the Qwen3 geometry `$size`: the
+/// base model `$body`'s call, its rows overridden by the caller's, then the greedy head `$head`.
+/// A call's override rows fill the table's last rows, one a call row, so a checkpoint's tokens end
+/// before them.
+macro_rules! conditionals {
+    ($($model:ty, $size:ty, $body:ident, $head:ident);+ $(;)?) => {$(
+        /// The model reads a whole checkpoint and serves its calls with a second owner of its
+        /// token table's storage.
+        impl crate::registry::Listed for $model {
+            fn reads(part: Part) -> Result<(), LoadError> {
+                match part {
+                    Part::Whole => Ok(()),
+                    Part::Encoder => Err(LoadError::Unsupported {
+                        name: "encoder".into(),
+                        reason: "a decoder holds no media encoder that loads alone".into(),
+                    }),
+                }
+            }
+
+            fn served(mut self, tiling: Tiling) -> crate::registry::Model {
+                let Then(Then(Backbone { embedding: Named(table), body }, norm), store) =
+                    self.$body.body;
+                let (table, storage) = (table.shared())
+                    .unwrap_or_else(|_| unreachable!("a buffer aliases itself"));
+                self.$body.body =
+                    Then(Then(Backbone { embedding: Named(table), body }, norm), store);
+                let decoder = Overriding { decoder: self, table: storage };
+                crate::registry::Model::Decoder(Box::new(Instance::new(decoder, tiling)))
+            }
+        }
+
+        /// The kept rows' greedy tokens.
+        impl Decoder for Overriding<$model> {
+            const OUTPUT: Output = Output::Tokens;
+            type Output = Rows<i32, m![1]>;
+            type Layers = <$size as Geometry>::Layers<Blocks<KvHeads, Head>>;
+            /// The base model's, of which the conditional model's calls run none.
+            type Adapter = <Base<$size> as Decoder>::Adapter;
+
+            fn limits(&self) -> Limits {
+                Limits {
+                    adapters: <Self as Decoder>::ADAPTERS,
+                    overrides: <$size as Geometry>::Hidden::SIZE,
+                    ..self.decoder.$body.limits()
+                }
+            }
+
+            fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
+                views(storage)
+            }
+
+            async fn call(
+                &self,
+                device: &mut Device,
+                layers: &mut Self::Layers,
+                batch: Batch<'_, Self::Adapter>,
+                tiling: Tiling,
+            ) -> io::Result<Rows<i32, m![1]>> {
+                type W = <$size as Geometry>::Hidden;
+                let first = <$size as Geometry>::Vocabulary::SIZE - <$size as Decode>::Rows::SIZE;
+                let row = Rows::<bf16, Symbol<W>>::bytes();
+                let batch = batch.place(device, &self.table, (first, row)).await?;
+                let kept = self.decoder.$body.call(device, layers, batch, tiling).await?;
+                greedy!($size, &self.decoder.$head, device, kept)
+            }
+        }
+    )+};
+}
+
+conditionals!(
+    qwen3_asr::ForConditionalGeneration<
+        qwen3::Size<"1.7B">,
+        form::Affine,
+        Parallel<1>,
+        cache::Bf16,
+        Hbm,
+    >,
+    qwen3::Size<"1.7B">,
+    language_model,
+    lm_head;
+    qwen3_tts::ForConditionalGeneration<
+        qwen3_tts::Talker<"1.7B">,
+        form::Affine,
+        Parallel<1>,
+        cache::Bf16,
+        Hbm,
+    >,
+    qwen3_tts::Talker<"1.7B">,
+    model,
+    codec_head;
+);
+
+/// Qwen3-TTS 1.7B's BF16 code predictor on one chip.
+pub type CodePredictor = qwen3_tts::CodePredictor<
+    qwen3_tts::Predictor<"1.7B">,
+    form::Affine,
+    Parallel<1>,
+    cache::Bf16,
+    Hbm,
+>;
+
+type Predictor = qwen3_tts::Predictor<"1.7B">;
+
+/// The rows a predictor call projects at once: a block of the projection's rows, past its rows.
+type Block = axis::Rows<128>;
+
+/// The predictor reads a whole checkpoint and serves its calls with a second owner of its body's
+/// token table's storage, whose rows from the codebook's entries on take each call's input rows.
+impl crate::registry::Listed for CodePredictor {
+    fn reads(part: Part) -> Result<(), LoadError> {
+        match part {
+            Part::Whole => Ok(()),
+            Part::Encoder => Err(LoadError::Unsupported {
+                name: "encoder".into(),
+                reason: "a decoder holds no media encoder that loads alone".into(),
+            }),
+        }
+    }
+
+    fn served(mut self, tiling: Tiling) -> crate::registry::Model {
+        let Then(
+            Then(
+                Backbone {
+                    embedding: Named(table),
+                    body,
+                },
+                norm,
+            ),
+            store,
+        ) = self.model.body;
+        let (table, storage) =
+            (table.shared()).unwrap_or_else(|_| unreachable!("a buffer aliases itself"));
+        self.model.body = Then(
+            Then(
+                Backbone {
+                    embedding: Named(table),
+                    body,
+                },
+                norm,
+            ),
+            store,
+        );
+        let decoder = Overriding {
+            decoder: self,
+            table: storage,
+        };
+        crate::registry::Model::Decoder(Box::new(Instance::new(decoder, tiling)))
+    }
+}
+
+/// Each kept row's pick of the entry its position names, every kept row at one position: row
+/// `q > 0` of a frame's sequence picks entry `q` by head `q - 1`. A call's row is the override
+/// it gives, the talker's hidden row at position 0, or its token's row of the table its position
+/// names; the call projects them into the body's table, from row 2048 on, which its token IDs
+/// then name.
+impl Decoder for Overriding<CodePredictor> {
+    const OUTPUT: Output = Output::Tokens;
+    type Output = Rows<i32, m![1]>;
+    type Layers = <Predictor as Geometry>::Layers<Blocks<KvHeads, Head>>;
+    /// The base model's, of which the predictor's calls run none.
+    type Adapter = <Base<Predictor> as Decoder>::Adapter;
+
+    fn limits(&self) -> Limits {
+        Limits {
+            adapters: <Self as Decoder>::ADAPTERS,
+            overrides: qwen3_tts::Text::SIZE,
+            ..self.decoder.model.limits()
+        }
+    }
+
+    fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
+        views(storage)
+    }
+
+    async fn call(
+        &self,
+        device: &mut Device,
+        layers: &mut Self::Layers,
+        batch: Batch<'_, Self::Adapter>,
+        tiling: Tiling,
+    ) -> io::Result<Rows<i32, m![1]>> {
+        type Text = qwen3_tts::Text;
+        type W = <Predictor as Geometry>::Hidden;
+        let unsupported = |message: &str| io::Error::new(io::ErrorKind::Unsupported, message);
+        let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message);
+        let other = io::Error::other;
+        let positions = batch.positions();
+        let mut steps = batch.kept().iter().map(|&row| positions[row]);
+        let step = steps.next().unwrap_or(1);
+        if steps.any(|other| other != step) {
+            return Err(unsupported(
+                "the kept rows of a predictor call share one position",
+            ));
+        }
+        if !(1..=qwen3_tts::GROUPS).contains(&step) {
+            return Err(invalid(
+                "a kept row picks an entry of a later codebook, at 1 to 15",
+            ));
+        }
+        if positions
+            .iter()
+            .any(|&position| position > qwen3_tts::GROUPS)
+        {
+            return Err(invalid("a frame's sequence holds 16 rows"));
+        }
+        // Each call row's input, of the talker's width, in a block of the projection's rows.
+        let text = Rows::<bf16, Symbol<Text>>::bytes();
+        let inputs = HbmBuffer::alloc(device, Block::SIZE * text).map_err(other)?;
+        let row = |buffer: &HbmBuffer, at: usize| {
+            (buffer.alias(at * text..(at + 1) * text)).map_err(io::Error::other)
+        };
+        let mut given = vec![false; positions.len()];
+        let mut pairs = Vec::new();
+        for (rows, values) in batch.overrides() {
+            for (at, call) in rows.enumerate() {
+                given[call] = true;
+                pairs.push((row(values, at)?, row(&inputs, call)?));
+            }
+        }
+        if (positions.iter().zip(&given)).any(|(&position, &given)| position == 0 && !given) {
+            return Err(invalid(
+                "a frame's first row is the talker's hidden row, an override",
+            ));
+        }
+        // The rows of each table, gathered by their tokens' byte offsets.
+        let lanes = <axis::Lanes<Block> as AxisName>::SIZE;
+        let word = Rows::<i32, m![1]>::bytes();
+        let ids_bytes = HbmTensor::<i32, Chip, Packets<Block>>::size();
+        for table in 1..=qwen3_tts::GROUPS {
+            let rows: Vec<usize> = (0..positions.len())
+                .filter(|&call| !given[call] && positions[call] == table)
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let zeros = vec![0; ids_bytes];
+            let ids = HostBufferSlice::from(&zeros[..])
+                .to_hbm(&mut device.pdma)
+                .await
+                .map_err(other)?;
+            let mut tokens = (rows.iter().enumerate())
+                .map(|(at, &call)| {
+                    let at = (at / lanes) * 8 + at % lanes;
+                    Ok((
+                        batch.token(call)?,
+                        ids.alias(at * word..(at + 1) * word).map_err(other)?,
+                    ))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            ops_copy(device, tokens.iter_mut().map(|(from, to)| (&*from, to)))?;
+            let ids: HbmTensor<i32, Chip, Packets<Block>> = alias(&ids, ..)?;
+            let offsets: HbmTensor<i32, Chip, m![Block]> =
+                Function::new(&ByteOffset::<bf16, m![Text], m![Block]>::default(), forward)
+                    .forward(device, (), &mut (), &ids)
+                    .await?;
+            let gathered: HbmTensor<bf16, Chip, m![Block, Text]> = match table {
+                1 => {
+                    Function::new(&Gather, forward)
+                        .forward(device, (), &mut (), (&self.decoder.talker_table, &offsets))
+                        .await?
+                }
+                _ => {
+                    let source = &self.decoder.tables[table - 2];
+                    Function::new(&Gather, forward)
+                        .forward(device, (), &mut (), (source, &offsets))
+                        .await?
+                }
+            };
+            let gathered = gathered.into_buffer();
+            for (at, &call) in rows.iter().enumerate() {
+                pairs.push((row(&gathered, at)?, row(&inputs, call)?));
+            }
+        }
+        ops_copy(device, pairs.iter_mut().map(|(from, to)| (&*from, to)))?;
+        // Projected into the body's width, into the body's table from the codebook's entries on.
+        let inputs: HbmTensor<bf16, Chip, m![Block, Text]> = alias(&inputs, ..)?;
+        let projection = &self.decoder.small_to_mtp_projection;
+        let projection = Affine::new(&projection.weight, &projection.bias);
+        let projected: HbmTensor<bf16, Chip, m![Block, W]> = Function::new(&projection, forward)
+            .forward(device, (), &mut (), &inputs)
+            .await?;
+        let first = qwen3_tts::Codebook::SIZE;
+        let width = Rows::<bf16, Symbol<W>>::bytes();
+        let mut placed = (self
+            .table
+            .alias(first * width..(first + Block::SIZE) * width))
+        .map_err(other)?;
+        let projected = projected.into_buffer();
+        ops_copy(device, [(&projected, &mut placed)])?;
+        let batch = batch.named(device, first).await?;
+        let kept = self
+            .decoder
+            .model
+            .call(device, layers, batch, tiling)
+            .await?;
+        greedy!(Predictor, &self.decoder.lm_head[step - 1], device, kept)
+    }
+}
 
 /// The BF16 base model of the size `S` on one chip, whose calls a classifier of `S` makes.
 type Base<S> = qwen3::Model<S, form::Affine, Parallel<1>, cache::Bf16, Hbm>;
@@ -402,7 +725,7 @@ macro_rules! launches {
                     rows: launch::Capacity::<$size>::SIZE,
                     cache: CacheSpec {
                         pools: vec![Pool {
-                            block: Block::SIZE,
+                            block: CacheBlock::SIZE,
                             bytes: Blocks::<KvHeads, Head>::BLOCK_STRIDE as usize,
                         }],
                         groups: vec![Group {
@@ -413,6 +736,7 @@ macro_rules! launches {
                         }],
                     },
                     adapters: Self::ADAPTERS,
+                    overrides: 0,
                 }
             }
 

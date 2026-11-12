@@ -264,6 +264,7 @@ mod tests {
                     }],
                 },
                 adapters: 0,
+                overrides: 0,
             };
             let cache = Cache::new(&device, &limits.cache, 4)?;
             let mut requests = Vec::new();

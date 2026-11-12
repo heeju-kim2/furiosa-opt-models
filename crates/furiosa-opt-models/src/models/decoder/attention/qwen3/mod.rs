@@ -103,8 +103,7 @@ type Rows<S> = <S as Decode>::Rows;
 type Body<S, P, Q, C, X> = Then<
     Normalized<
         Backbone<
-            Named<
-                "embed_tokens",
+            <S as Front>::Table<
                 Embedding<
                     Vocabulary<S>,
                     Hidden<S>,
@@ -129,6 +128,9 @@ pub trait Front {
     type Heads<Projection, Norm>;
     /// The norm of each query or key head of the catalog's layer: `Norm`, or none, `()`.
     type HeadNorm<Norm>;
+    /// The token table `Table` under the name its checkpoints store it at, `embed_tokens` for the
+    /// text families.
+    type Table<Table>;
 }
 
 /// The packed query, key and value projection of a size in form `P`, unpacked into heads.
@@ -148,6 +150,7 @@ impl<const N: &'static str> Front for Size<N> {
     type Heads<Projection, Norm> =
         NormalizedQkv<Projection, Named<"q_norm", Norm>, Named<"k_norm", Norm>>;
     type HeadNorm<Norm> = Norm;
+    type Table<Table> = Named<"embed_tokens", Table>;
 }
 
 /// The size's query, key and value front, the rotation, the cache write, the attention over each

@@ -14,9 +14,9 @@
 use crate::decoder::{Decoder, Instance, Served};
 use crate::vision_language::Encoder;
 use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError, Part};
-use furiosa_opt_models::models::decoder::attention::{llama, qwen3};
+use furiosa_opt_models::models::decoder::attention::{llama, qwen3, qwen3_tts};
 use furiosa_opt_models::models::decoder::form;
-use furiosa_opt_models::models::vision_language::gemma4_unified;
+use furiosa_opt_models::models::vision_language::{gemma4_unified, qwen3_asr};
 use furiosa_opt_models::models::{Class, Implements};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::tensor::cache;
@@ -417,7 +417,18 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
     ("Qwen3NextMTP", &[]),
     ("Qwen3OmniDSparkModel", &[]),
     ("Qwen3OmniMoeTalkerForConditionalGeneration", &[]),
-    ("Qwen3TTSForConditionalGeneration", &[]),
+    (
+        "Qwen3TTSForConditionalGeneration",
+        &[Implementation::of::<
+            qwen3_tts::ForConditionalGeneration<
+                qwen3_tts::Talker<"1.7B">,
+                form::Affine,
+                Parallel<1>,
+                cache::Bf16,
+                Hbm,
+            >,
+        >()],
+    ),
     ("Qwen3TTSTalkerForConditionalGeneration", &[]),
     ("Qwen3_5ForCausalLM", &[]),
     ("Qwen3_5ForCausalLMMTP", &[]),
@@ -684,7 +695,18 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
     // Source: <https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni_thinker.py>.
     ("Qwen2_5OmniThinkerModel", &[]),
     ("Qwen2_5_VLForConditionalGeneration", &[]),
-    ("Qwen3ASRForConditionalGeneration", &[]),
+    (
+        "Qwen3ASRForConditionalGeneration",
+        &[Implementation::of::<
+            qwen3_asr::ForConditionalGeneration<
+                qwen3::Size<"1.7B">,
+                form::Affine,
+                Parallel<1>,
+                cache::Bf16,
+                Hbm,
+            >,
+        >()],
+    ),
     ("Qwen3ASRForcedAlignerForTokenClassification", &[]),
     ("Qwen3ASRRealtimeGeneration", &[]),
     ("Qwen3OmniMoeForConditionalGeneration", &[]),

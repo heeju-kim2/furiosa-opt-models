@@ -149,6 +149,26 @@ impl<'d> Context<'d> {
         }
     }
 
+    /// The config the current scope names, a subtree such as `text_config`'s, or the whole config
+    /// outside every scope; `Missing` under the scope's config name when the config lacks it.
+    pub fn scoped_config<'s>(
+        &mut self,
+        source: &'s Checkpoint,
+    ) -> Result<&'s serde_json::Value, LoadError> {
+        let path = Self::join(&self.cursor.scope);
+        if path.is_empty() {
+            return Ok(source.config());
+        }
+        let (_, value) = self.config_value(source, "")?;
+        match value.is_object() {
+            true => Ok(value),
+            false => Err(LoadError::InvalidData {
+                name: format!("config.json:{path}"),
+                reason: format!("{value} is not an object"),
+            }),
+        }
+    }
+
     /// The number at `key` in the current scope and its config name, read as `config_value` reads.
     pub fn config_number(
         &mut self,

@@ -13,6 +13,9 @@
 //!   attention: under `Tiling::Fixed` a row's values do not depend on the other rows of its calls.
 //! - A call may run its requests with LoRA adapters: the caller's list of them, which a request
 //!   names an adapter of by its index (`adapter`); the batch keeps the list it checked.
+//! - A conditional decoder's request may replace its rows' embeddings with rows of its own
+//!   (`overrides`), as media rows replace their placeholder tokens: the call copies each into a row
+//!   of the token table that no token reads, and the row's token ID names that row.
 
 mod adapters;
 mod batch;
@@ -50,7 +53,7 @@ pub struct Request {
     /// the cached positions. `None` is causal.
     pub mask: Option<HbmBuffer>,
     /// BF16 rows of the body's width that replace the embedding of the appended rows from each
-    /// offset on.
+    /// offset on; the spans of one request do not overlap.
     pub overrides: Vec<(usize, HbmBuffer)>,
 }
 
@@ -98,6 +101,9 @@ pub struct Limits {
     pub cache: CacheSpec,
     /// Adapters a call runs at most; none for a decoder whose projections take no adapter terms.
     pub adapters: usize,
+    /// Features of the BF16 rows a request's overrides replace its rows' embeddings with; zero for
+    /// a decoder that takes none.
+    pub overrides: usize,
 }
 
 /// What a call returns of each kept row.

@@ -46,6 +46,7 @@ pub mod mixtral;
 pub mod olmoe;
 pub mod qwen3;
 pub mod qwen3_moe;
+pub mod qwen3_tts;
 
 /// A published size of an attention decoder: its axes and the config values its type fixes.
 pub trait Geometry {
@@ -166,8 +167,10 @@ where
         context.checkpoint(from, |cx| {
             let (spectrum, trained) = match Layer::NAME {
                 None => {
-                    let spectrum: Spectrum = config::parse(from.config()).map_err(refusal)?;
-                    let trained: Trained = config::parse(from.config()).map_err(refusal)?;
+                    // The scope's config: a conditional model's text model reads its own.
+                    let document = cx.scoped_config(from)?;
+                    let spectrum: Spectrum = config::parse(document).map_err(refusal)?;
+                    let trained: Trained = config::parse(document).map_err(refusal)?;
                     (spectrum, trained.max_position_embeddings)
                 }
                 Some(layer) => {
