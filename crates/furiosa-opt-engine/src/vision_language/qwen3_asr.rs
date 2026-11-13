@@ -7,29 +7,22 @@ use crate::registry::{Listed, Model};
 use crate::{AsyncModule, Function, forward};
 use furiosa_opt_models::load::{LoadError, Part};
 use furiosa_opt_models::models::vision_language::qwen3_asr::audio::{
-    self, Band, Bidirectional, CHUNKS, Channels, FRAMES, FREQUENCIES, Filters, Flat, Frontend,
-    Intermediate, Major, Mel, Projected as Projected1, Rows, TIMES, Text, Tile, Tower, Width,
+    self, Band, Bidirectional, CHUNKS, Channels, Clip, EMPTY, FRAMES, Filters, First, Flat,
+    Frontend, Intermediate, LIVE, Major, Mel, Pixels, Projected as Projected1, Rows, Second, TIMES,
+    Text, Third, Tile, Tower, Width,
 };
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::ops::attention::single::Visible;
 use furiosa_opt_models::ops::index::copy;
 use furiosa_opt_models::ops::index::gather::Gather;
 use furiosa_opt_models::ops::pointwise::{activation::Gelu, add::Add};
-use furiosa_opt_models::tensor::axis;
 use furiosa_opt_models::tensor::memory::alias;
 use furiosa_opt_models::tensor::parallel::Chip;
 use furiosa_opt_std::prelude::*;
 use std::io;
 use std::pin::Pin;
 
-axes![Clip = 801, Pixels = 32768];
-
-/// A launch's rows after each convolution, the live ones first: 400 output times of 64
-/// frequencies, 6400 pixels then the zero row, 1664 pixels, and 104 output times.
-type First = axis::Rows<512>;
-type Second = axis::Rows<6528>;
-type Third = axis::Rows<2048>;
-pub type Times = axis::Rows<128>;
+pub use furiosa_opt_models::models::vision_language::qwen3_asr::audio::Times;
 
 /// The launch's mel frames, `CHUNKS` chunks of 100 frames, then one zero frame.
 pub type Frames = HbmTensor<bf16, Chip, m![Clip, Mel]>;
@@ -37,40 +30,23 @@ pub type Frames = HbmTensor<bf16, Chip, m![Clip, Mel]>;
 /// Rows of the tower's width, one an output time, chunk-major.
 pub type Embedded = HbmTensor<bf16, Chip, m![Times, Width]>;
 
-/// `values` in HBM of `device`.
-async fn upload(device: &mut Device, values: &[i32]) -> io::Result<HbmBuffer> {
-    let bytes: Vec<u8> = values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
-    HostBufferSlice::from(&bytes[..])
-        .to_hbm(&mut device.pdma)
-        .await
-        .map_err(io::Error::other)
-}
-
-/// Writes zeros over `bytes` bytes of `buffer` from `start`.
-async fn zero(
+/// Writes the zero row `zeros` over `buffer`'s bytes from `start`.
+fn zero(
     device: &mut Device,
+    zeros: &HbmBuffer,
     buffer: &HbmBuffer,
     start: usize,
-    bytes: usize,
 ) -> io::Result<()> {
-    let zeros = HostBufferSlice::from(&vec![0u8; bytes][..])
-        .to_hbm(&mut device.pdma)
-        .await
-        .map_err(io::Error::other)?;
-    let mut target = buffer
-        .alias(start..start + bytes)
-        .map_err(io::Error::other)?;
-    copy(device, [(&zeros, &mut target)])
+    let end = start + zeros.size();
+    let mut target = buffer.alias(start..end).map_err(io::Error::other)?;
+    copy(device, [(zeros, &mut target)])
 }
 
 /// The sum of each tap's projection of the rows of `table` its offsets name, through GELU.
 async fn convolve<Table, R, In, Out>(
     device: &mut Device,
     table: &HbmTensor<bf16, Chip, m![Table, In]>,
-    offsets: &[Vec<i32>],
+    offsets: &[HbmTensor<i32, Chip, m![R]>],
     taps: &[audio::Biased<In, Out>],
 ) -> io::Result<HbmTensor<bf16, Chip, m![R, Out]>>
 where
@@ -81,9 +57,8 @@ where
 {
     let mut sum: Option<HbmTensor<bf16, Chip, m![R, Out]>> = None;
     for (offsets, tap) in offsets.iter().zip(taps) {
-        let offsets: HbmTensor<i32, Chip, m![R]> = alias(&upload(device, offsets).await?, ..)?;
         let rows: HbmTensor<bf16, Chip, m![R, In]> = Function::new(&Gather, forward)
-            .forward(device, (), &mut (), (table, &offsets))
+            .forward(device, (), &mut (), (table, offsets))
             .await?;
         let projected: HbmTensor<bf16, Chip, m![R, Out]> = Function::new(tap, forward)
             .forward(device, (), &mut (), &rows)
@@ -110,37 +85,29 @@ pub async fn embed(
     device: &mut Device,
     frames: &Frames,
 ) -> io::Result<Embedded> {
-    let mel = Mel::SIZE * size_of::<bf16>();
-    let pixel = Channels::SIZE * size_of::<bf16>();
-    let first: HbmTensor<bf16, Chip, m![First, Band]> = convolve::<Clip, First, Mel, Band>(
-        device,
-        frames,
-        &audio::frames(First::SIZE, CHUNKS * FRAMES, mel),
-        &frontend.conv1,
-    )
-    .await?;
+    let (offsets, pixel) = (&frontend.offsets, Channels::SIZE * size_of::<bf16>());
+    let first: HbmTensor<bf16, Chip, m![First, Band]> =
+        convolve::<Clip, First, Mel, Band>(device, frames, &offsets.conv1, &frontend.conv1).await?;
     // The last output time's first pixel reads as the zero row of the second convolution's taps.
     let first = first.into_buffer();
-    let empty = (First::SIZE - 1) * FREQUENCIES[0];
-    zero(device, &first, empty * pixel, pixel).await?;
+    zero(device, &frontend.zero, &first, EMPTY * pixel)?;
     let first: HbmTensor<bf16, Chip, m![Pixels, Channels]> = alias(&first, ..)?;
-    let live = CHUNKS * TIMES[1] * FREQUENCIES[1];
     let second: HbmTensor<bf16, Chip, m![Second, Filters]> =
         convolve::<Pixels, Second, Channels, Filters>(
             device,
             &first,
-            &audio::offsets(1, Second::SIZE, empty, pixel),
+            &offsets.conv2,
             &frontend.conv2,
         )
         .await?;
     let second = second.into_buffer();
-    zero(device, &second, live * pixel, pixel).await?;
+    zero(device, &frontend.zero, &second, LIVE * pixel)?;
     let second: HbmTensor<bf16, Chip, m![Second, Filters]> = alias(&second, ..)?;
     let third: HbmTensor<bf16, Chip, m![Third, Channels]> =
         convolve::<Second, Third, Filters, Channels>(
             device,
             &second,
-            &audio::offsets(2, Third::SIZE, live, pixel),
+            &offsets.conv3,
             &frontend.conv3,
         )
         .await?;
@@ -148,13 +115,8 @@ pub async fn embed(
     let projected: Embedded = Function::new(&frontend.conv_out, forward)
         .forward(device, (), &mut (), &flat)
         .await?;
-    let width = Width::SIZE * size_of::<bf16>();
-    let phases: Vec<i32> = (0..Times::SIZE)
-        .map(|row| ((row % TIMES[2]) * width) as i32)
-        .collect();
-    let phases: HbmTensor<i32, Chip, m![Times]> = alias(&upload(device, &phases).await?, ..)?;
     let positions: Embedded = Function::new(&Gather, forward)
-        .forward(device, (), &mut (), (&frontend.positions, &phases))
+        .forward(device, (), &mut (), (&frontend.positions, &offsets.phases))
         .await?;
     Function::new(&Add, forward)
         .forward(device, (), &mut (), (&projected, &positions))
@@ -190,13 +152,12 @@ pub async fn encode(
     }
     let embedded = embed(&tower.frontend, device, frames).await?.into_buffer();
     let row = Width::SIZE * size_of::<bf16>();
-    let tile = HostBufferSlice::from(&vec![0u8; Rows::SIZE * row][..])
-        .to_hbm(&mut device.pdma)
-        .await
+    let mut head = tower
+        .tile
+        .alias(..Times::SIZE * row)
         .map_err(io::Error::other)?;
-    let mut head = tile.alias(..Times::SIZE * row).map_err(io::Error::other)?;
     copy(device, [(&embedded, &mut head)])?;
-    let mut hidden: Hidden = alias(&tile, ..)?;
+    let mut hidden: Hidden = alias(&tower.tile, ..)?;
     let visible: Vec<u8> = (0..Rows::SIZE)
         .flat_map(|key| {
             bf16::from_f32(if key < live { 1.0 } else { 0.0 })

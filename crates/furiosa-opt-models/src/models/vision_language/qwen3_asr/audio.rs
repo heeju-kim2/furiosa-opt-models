@@ -29,11 +29,14 @@ use crate::ops::attention::Attention;
 use crate::ops::attention::single::{Head, Tokens, Trips, Visible};
 use crate::ops::linear::{Affine, Linear, PerHead};
 use crate::ops::normalization::LayerNorm;
+use crate::tensor::axis;
 use crate::tensor::parallel::Chip;
 use crate::tensor::scalar::F32;
 use crate::{Module, Op};
 
 axes![
+    Clip = 801,
+    Pixels = 32768,
     Mel = 128,
     Band = 32768,
     Channels = 512,
@@ -62,14 +65,41 @@ pub type Biased<In, Out> =
 
 /// The tower's convolutions, its flattening projection and its position table, as the device
 /// projects them: each convolution a projection a kernel tap, the bias in the first.
-#[derive(DeviceSend)]
 pub struct Frontend {
     pub conv1: [Biased<Mel, Band>; 3],
     pub conv2: [Biased<Channels, Filters>; 9],
     pub conv3: [Biased<Filters, Channels>; 9],
     pub conv_out: Linear<Flat, Width, Chip>,
     pub positions: HbmTensor<bf16, Chip, m![Phases, Width]>,
+    /// The byte offsets of the rows each tap gathers, fixed by a launch's rows.
+    pub offsets: Offsets,
+    /// A pixel's zero row, which a caller copies where a convolution's taps outside its input
+    /// read.
+    pub zero: HbmBuffer,
 }
+
+/// The byte offsets of the rows each convolution's taps gather, and of each output time's
+/// position row: [`frames`] and [`offsets`] of a launch's rows, on the device once.
+#[derive(DeviceSend)]
+pub struct Offsets {
+    pub conv1: [HbmTensor<i32, Chip, m![First]>; 3],
+    pub conv2: [HbmTensor<i32, Chip, m![Second]>; 9],
+    pub conv3: [HbmTensor<i32, Chip, m![Third]>; 9],
+    pub phases: HbmTensor<i32, Chip, m![Times]>,
+}
+
+/// A launch's rows after each convolution, the live ones first: 400 output times of 64
+/// frequencies, 6400 pixels then the zero row, 1664 pixels, and 104 output times.
+pub type First = axis::Rows<512>;
+pub type Second = axis::Rows<6528>;
+pub type Third = axis::Rows<2048>;
+pub type Times = axis::Rows<128>;
+
+/// The pixel the second convolution's taps outside its input read: the last output time's first.
+pub const EMPTY: usize = (First::SIZE - 1) * FREQUENCIES[0];
+
+/// The second convolution's live pixels, after which its zero row lies.
+pub const LIVE: usize = CHUNKS * TIMES[1] * FREQUENCIES[1];
 
 /// The convolutions under `conv2d1`..`conv2d3`, the projection under `conv_out` and the sinusoids
 /// of the chunk's times, each rearranged on host.
@@ -154,12 +184,62 @@ impl<'a> Load<&'a Checkpoint> for Frontend {
                 HostTensor::<bf16, m![Phases, Width]>::from_vec(positions),
             )
         })?;
+        let offsets = cx.field("offsets", "", |cx| {
+            let (mel, pixel) = (
+                Mel::SIZE * size_of::<bf16>(),
+                Channels::SIZE * size_of::<bf16>(),
+            );
+            let width = Width::SIZE * size_of::<bf16>();
+            let mut conv1 = Vec::new();
+            for tap in frames(First::SIZE, CHUNKS * FRAMES, mel) {
+                conv1.push(HbmTensor::load(
+                    cx,
+                    HostTensor::<i32, m![First]>::from_vec(tap),
+                )?);
+            }
+            let mut conv2 = Vec::new();
+            for tap in offsets(1, Second::SIZE, EMPTY, pixel) {
+                conv2.push(HbmTensor::load(
+                    cx,
+                    HostTensor::<i32, m![Second]>::from_vec(tap),
+                )?);
+            }
+            let mut conv3 = Vec::new();
+            for tap in offsets(2, Third::SIZE, LIVE, pixel) {
+                conv3.push(HbmTensor::load(
+                    cx,
+                    HostTensor::<i32, m![Third]>::from_vec(tap),
+                )?);
+            }
+            let phases: Vec<i32> = (0..Times::SIZE)
+                .map(|row| ((row % TIMES[2]) * width) as i32)
+                .collect();
+            Ok::<_, LoadError>(Offsets {
+                conv1: conv1
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("three taps")),
+                conv2: conv2
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("nine taps")),
+                conv3: conv3
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("nine taps")),
+                phases: HbmTensor::load(cx, HostTensor::<i32, m![Times]>::from_vec(phases))?,
+            })
+        })?;
+        let zero: HbmTensor<bf16, Chip, m![Channels]> = cx.field("zero", "", |cx| {
+            let zeros = vec![bf16::from_f32(0.0); Channels::SIZE];
+            HbmTensor::load(cx, HostTensor::<bf16, m![Channels]>::from_vec(zeros))
+        })?;
+        let zero = zero.into_buffer();
         Ok(Self {
             conv1,
             conv2,
             conv3,
             conv_out,
             positions,
+            offsets,
+            zero,
         })
     }
 }
@@ -202,13 +282,15 @@ pub const LAYERS: usize = 24;
 
 /// The tower and its projector: the frontend, the layers and the final norm under
 /// `model.audio_tower`, then `model.multi_modal_projector`'s GELU pair into the text model's width.
-#[derive(DeviceSend)]
 pub struct Tower {
     pub frontend: Frontend,
     pub layers: [Layer; LAYERS],
     pub ln_post: Norm,
     pub linear_1: Biased<Width, Projected>,
     pub linear_2: Biased<Projected, Text>,
+    /// An attention tile's rows, zero past a launch's output times, whose first rows each launch
+    /// writes.
+    pub tile: HbmBuffer,
 }
 
 /// The tower under `audio_tower` and the projector under `multi_modal_projector`, below `model`,
@@ -243,8 +325,14 @@ impl Tower {
             let second = cx.field("linear_2", "linear_2", |cx| Biased::load(cx, from))?;
             Ok::<_, LoadError>((first, second))
         })?;
+        let zeros = vec![bf16::from_f32(0.0); Rows::SIZE * Width::SIZE];
+        let tile: HbmTensor<bf16, Chip, m![Rows, Width]> = cx.field("tile", "", |cx| {
+            HbmTensor::load(cx, HostTensor::<bf16, m![Rows, Width]>::from_vec(zeros))
+        })?;
+        let tile = tile.into_buffer();
         Ok(Self {
             frontend,
+            tile,
             layers: layers
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("one layer an index")),
