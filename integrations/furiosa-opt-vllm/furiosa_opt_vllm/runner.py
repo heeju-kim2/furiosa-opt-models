@@ -101,6 +101,12 @@ class Runner:
         self.requests: dict[str, CachedRequestState] = {}
         # req_id -> the logprobs of fixed token IDs the request asks for at its prompt rows.
         self.prompt_scores: dict[str, TokenScores] = {}
+        # req_id -> each media item's first placeholder position and its rows, which replace the
+        # embeddings of its placeholders.
+        self.media: dict[str, list[tuple[int, engine.HbmTensor]]] = {}
+        # A media item's identifier -> its rows, which a later request of the item reads: vLLM
+        # sends an item it sent before without its inputs.
+        self.embedded: dict[str, engine.HbmTensor] = {}
         self.draws: dict[str, dict[int, torch.Tensor]] = {}
         self.pending: tuple[SchedulerOutput, Argmax | Logits] | None = None
         # Greedy steps whose output vLLM has not collected, oldest first.

@@ -2,7 +2,8 @@
 
 A call's rows take their tokens from one operand on the device, except that the last row of a
 decoding run may take the token an uncollected call selects there; a sequence's rows run with the
-adapter of its slot in the runner's list of adapters.
+adapter of its slot in the runner's list of adapters, and its media items' rows replace the
+embeddings of their placeholder positions.
 """
 
 from __future__ import annotations
@@ -79,8 +80,11 @@ def forward(runner: Runner, entry: Entry, call: Call[str], feed: Feed) -> engine
                 raise RuntimeError("rows with known tokens need the uploaded IDs")
             head_keep = keep if tail is None or feed.every else engine.decoder.Keep.NONE
             tokens = feed.operand[head[0] : head[-1] + 1]
+            replaced = overrides(runner, request.sequence, request.cached, len(head))
             requests.append(
-                engine.decoder.Request(blocks, request.cached, tokens, head_keep, adapter=slot)
+                engine.decoder.Request(
+                    blocks, request.cached, tokens, head_keep, adapter=slot, overrides=replaced
+                )
             )
         if tail is not None:
             selector, index = tail
@@ -90,3 +94,16 @@ def forward(runner: Runner, entry: Entry, call: Call[str], feed: Feed) -> engine
     adapters = runner.adapters.slots if runner.adapters is not None else None
     return entry(requests, cache, adapters)
     # --8<-- [end:execute]
+
+
+def overrides(
+    runner: Runner, sequence: str, cached: int, count: int
+) -> list[tuple[int, engine.HbmTensor]]:
+    """The rows of `sequence`'s media items that replace the embeddings of its `count` rows from
+    position `cached` on, each at its offset among them."""
+    replaced = []
+    for offset, rows in runner.media.get(sequence, ()):
+        start, end = max(offset, cached), min(offset + rows.shape[0], cached + count)
+        if start < end:
+            replaced.append((start - cached, rows[start - offset : end - offset]))
+    return replaced

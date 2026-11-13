@@ -7,6 +7,8 @@
   loaded model to free its device memory, and `loaded` brings the weights back by a new load.
 - Under sleep mode the decoder loads a copy of the checkpoint's tensors in host memory and keeps
   it, so level 1 wakes to the weights it loaded whatever later happens to the files.
+- A checkpoint whose architecture the engine lists a media encoder for loads it beside the
+  decoder, on its device: a prompt's media rows replace its placeholders' embeddings.
 - Under `VLLM_BATCH_INVARIANT=1` the load is batch invariant, and so is every load again: a row's
   values keep their bits whatever other rows share its calls.
 """
@@ -47,6 +49,9 @@ class Decoder:
     options: engine.LoadOptions
     device: engine.Device
     vocabulary: int
+    # The checkpoint's media encoder on the decoder's device, whose rows replace the embeddings of
+    # a prompt's media placeholders; None for a checkpoint without one.
+    media: engine.Encoder | None = None
     # A call allocates its buffers as it runs, from the memory the cache leaves free.
     workspace: ClassVar[int] = 0
 
@@ -64,6 +69,7 @@ class Decoder:
         copy = mapped.read() if model.enable_sleep_mode else None
         decoder = cls(None, copy, located, options(config), device, model.get_vocab_size())
         loaded = decoder.loaded(mapped if copy is None else copy)
+        loaded = replace(loaded, media=encoder(loaded.options, mapped, device))
         match loaded.model:
             case engine.Decoder(window=window) if model.max_model_len > window:
                 raise Refused("max_model_len", f"requires max_model_len at most {window}")
@@ -85,3 +91,19 @@ class Decoder:
         if self.model is None:
             raise RuntimeError(RELEASED)
         return self.model.rows
+
+
+def encoder(
+    options: engine.LoadOptions, checkpoint: engine.Checkpoint, device: engine.Device
+) -> engine.Encoder | None:
+    """The checkpoint's media encoder on `device`, or None when the engine lists none for it."""
+    loads = options.encoder()
+    try:
+        loads.parse(checkpoint)
+    except (NotImplementedError, ValueError):
+        return None
+    match loads.load(checkpoint, device):
+        case engine.Encoder() as media:
+            return media
+        case loaded:
+            raise NotImplementedError(f"{type(loaded).__name__} is no media encoder")

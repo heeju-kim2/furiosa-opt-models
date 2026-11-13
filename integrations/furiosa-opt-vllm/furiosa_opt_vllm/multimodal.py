@@ -89,6 +89,12 @@ def embed(model: Media, feature: MultiModalFeatureSpec) -> engine.HbmTensor:
                 tensor("pixel_position_ids_videos").flatten(0, -2),
             )
             (rows,) = model.encoder.vision([frames])
+        case "audio" if "input_audio_features" in data:
+            # Mel bins by frames, as vLLM's Qwen3-ASR processor flattens a clip's features.
+            features, length = tensor("input_audio_features"), tensor("audio_feature_lengths")
+            frames = features.reshape(features.shape[-2], -1)[:, : int(length.sum())]
+            clip = upload(model, frames.T.to(torch.bfloat16))
+            (rows,) = model.encoder.audio([engine.vision_language.Audio(clip)])
         case "audio":
             frames, mask = tensor("input_features_padded"), tensor("input_features_mask")
             valid = int(mask.sum())

@@ -118,6 +118,9 @@ class FuriosaWorker(WorkerBase):
         config = runner.vllm_config.model_config
         if ModelRegistry.is_transcription_only_model(config.architectures, config):
             return ("transcription",)
+        # A speech model also transcribes, its audio rows replacing their placeholders.
+        if ModelRegistry.is_transcription_model(config.architectures, config):
+            return ("generate", "transcription")
         return ("generate",)
 
     @override

@@ -7,13 +7,15 @@ import torch
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
-from furiosa_opt_vllm import generation
+import furiosa_opt_engine as engine
+from furiosa_opt_vllm import generation, multimodal
 from furiosa_opt_vllm.decoder import Decoder
 from furiosa_opt_vllm.multimodal import Media
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 
     from furiosa_opt_vllm.runner import Runner
@@ -22,6 +24,18 @@ if TYPE_CHECKING:
 def retire(runner: Runner, req_id: str) -> None:
     runner.selection.retire(req_id)
     _ = runner.prompt_scores.pop(req_id, None)
+    _ = runner.media.pop(req_id, None)
+
+
+def embedded(runner: Runner, items: Media, feature: MultiModalFeatureSpec) -> engine.HbmTensor:
+    """The rows of a media item, embedded once by its identifier: vLLM sends an item it sent
+    before without its inputs."""
+    if feature.data is None:
+        if (rows := runner.embedded.get(feature.identifier)) is None:
+            raise ValueError(f"media item {feature.identifier} arrived without its inputs")
+        return rows
+    rows = runner.embedded[feature.identifier] = multimodal.embed(items, feature)
+    return rows
 
 
 def update(runner: Runner, scheduler: SchedulerOutput) -> None:
@@ -48,7 +62,9 @@ def update(runner: Runner, scheduler: SchedulerOutput) -> None:
     match model:
         case Media():
             media = True
-        case None | Decoder():
+        case Decoder(media=encoder):
+            media = encoder is not None
+        case None:
             media = False
         case _:
             assert_never(model)
@@ -65,6 +81,12 @@ def update(runner: Runner, scheduler: SchedulerOutput) -> None:
         )
         if (asked := TokenScores.ask(request)) is not None:
             runner.prompt_scores[new.req_id] = asked
+        if new.mm_features and isinstance(model, Decoder) and model.media is not None:
+            items = Media(model.media, model.device)
+            runner.media[new.req_id] = [
+                (feature.mm_position.offset, embedded(runner, items, feature))
+                for feature in new.mm_features
+            ]
     for index, req_id in enumerate(cached.req_ids):
         request = runner.requests[req_id]
         runner.acknowledge(request, cached.num_output_tokens[index])
