@@ -15,6 +15,7 @@ pub mod gated;
 pub mod guidance;
 pub mod multiply;
 pub mod rescale;
+pub mod snake;
 pub mod softplus;
 
 /// `silu(gate) * up` of rows packed as their gate features followed by their up features.
