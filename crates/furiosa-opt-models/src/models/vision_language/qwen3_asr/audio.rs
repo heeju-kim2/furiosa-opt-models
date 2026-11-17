@@ -35,8 +35,6 @@ use crate::tensor::scalar::F32;
 use crate::{Module, Op};
 
 axes![
-    Clip = 801,
-    Pixels = 32768,
     Mel = 128,
     Band = 32768,
     Channels = 512,
@@ -71,35 +69,88 @@ pub struct Frontend {
     pub conv3: [Biased<Filters, Channels>; 9],
     pub conv_out: Linear<Flat, Width, Chip>,
     pub positions: HbmTensor<bf16, Chip, m![Phases, Width]>,
-    /// The byte offsets of the rows each tap gathers, fixed by a launch's rows.
-    pub offsets: Offsets,
+    /// The byte offsets of the rows each tap gathers, fixed by a launch's rows: of a launch of
+    /// two, four and eight chunks.
+    pub offsets: (Offsets<Two>, Offsets<Four>, Offsets<Eight>),
     /// A pixel's zero row, which a caller copies where a convolution's taps outside its input
     /// read.
     pub zero: HbmBuffer,
 }
 
-/// The byte offsets of the rows each convolution's taps gather, and of each output time's
-/// position row: [`frames`] and [`offsets`] of a launch's rows, on the device once.
+/// The byte offsets of the rows each convolution's taps gather in a launch `L`, and of each
+/// output time's position row: [`frames`] and [`offsets`] of its rows, on the device once.
 #[derive(DeviceSend)]
-pub struct Offsets {
-    pub conv1: [HbmTensor<i32, Chip, m![First]>; 3],
-    pub conv2: [HbmTensor<i32, Chip, m![Second]>; 9],
+pub struct Offsets<L: Launch> {
+    pub conv1: [HbmTensor<i32, Chip, m![{ Symbol<L::First> }]>; 3],
+    pub conv2: [HbmTensor<i32, Chip, m![{ Symbol<L::Second> }]>; 9],
     pub conv3: [HbmTensor<i32, Chip, m![Third]>; 9],
     pub phases: HbmTensor<i32, Chip, m![Times]>,
 }
 
-/// A launch's rows after each convolution, the live ones first: 400 output times of 64
-/// frequencies, 6400 pixels then the zero row, 1664 pixels, and 104 output times.
-pub type First = axis::Rows<512>;
-pub type Second = axis::Rows<6528>;
+/// A launch's chunks of 100 mel frames and its rows after each convolution, the live ones first:
+/// its frames then one zero frame, 50 output times a chunk of 64 frequencies, and 800 pixels a
+/// chunk then the zero row; every launch's third convolution computes 2048 pixel rows, 104 output
+/// times, the rows a projection's block holds.
+pub trait Launch: Send + Sync + 'static {
+    /// Chunks the launch holds.
+    const CHUNKS: usize;
+    /// The launch's mel frames and its zero frame.
+    type Clip: AxisName + Send + Sync;
+    /// Output times after the first convolution.
+    type First: AxisName + Send + Sync;
+    /// Pixels after the first convolution: 64 frequencies an output time.
+    type Pixels: AxisName + Send + Sync;
+    /// Pixels after the second convolution, then its zero row.
+    type Second: AxisName + Send + Sync;
+
+    /// The pixel the second convolution's taps outside its input read: the last output time's
+    /// first.
+    const EMPTY: usize = (Self::First::SIZE - 1) * FREQUENCIES[0];
+    /// The second convolution's live pixels, after which its zero row lies.
+    const LIVE: usize = Self::CHUNKS * TIMES[1] * FREQUENCIES[1];
+}
+
+/// A launch of two chunks, four and eight: 2 s, 4 s and 8 s of audio.
+pub struct Two;
+pub struct Four;
+pub struct Eight;
+
+axes![
+    Clip2 = 201,
+    Pixels2 = 8192,
+    Clip4 = 401,
+    Pixels4 = 16384,
+    Clip8 = 801,
+    Pixels8 = 32768
+];
+
+impl Launch for Two {
+    const CHUNKS: usize = 2;
+    type Clip = Clip2;
+    type First = axis::Rows<128>;
+    type Pixels = Pixels2;
+    type Second = axis::Rows<1664>;
+}
+
+impl Launch for Four {
+    const CHUNKS: usize = 4;
+    type Clip = Clip4;
+    type First = axis::Rows<256>;
+    type Pixels = Pixels4;
+    type Second = axis::Rows<3328>;
+}
+
+impl Launch for Eight {
+    const CHUNKS: usize = CHUNKS;
+    type Clip = Clip8;
+    type First = axis::Rows<512>;
+    type Pixels = Pixels8;
+    type Second = axis::Rows<6528>;
+}
+
+/// Every launch's rows after the third convolution, and its output times.
 pub type Third = axis::Rows<2048>;
 pub type Times = axis::Rows<128>;
-
-/// The pixel the second convolution's taps outside its input read: the last output time's first.
-pub const EMPTY: usize = (First::SIZE - 1) * FREQUENCIES[0];
-
-/// The second convolution's live pixels, after which its zero row lies.
-pub const LIVE: usize = CHUNKS * TIMES[1] * FREQUENCIES[1];
 
 /// The convolutions under `conv2d1`..`conv2d3`, the projection under `conv_out` and the sinusoids
 /// of the chunk's times, each rearranged on host.
@@ -185,47 +236,11 @@ impl<'a> Load<&'a Checkpoint> for Frontend {
             )
         })?;
         let offsets = cx.field("offsets", "", |cx| {
-            let (mel, pixel) = (
-                Mel::SIZE * size_of::<bf16>(),
-                Channels::SIZE * size_of::<bf16>(),
-            );
-            let width = Width::SIZE * size_of::<bf16>();
-            let mut conv1 = Vec::new();
-            for tap in frames(First::SIZE, CHUNKS * FRAMES, mel) {
-                conv1.push(HbmTensor::load(
-                    cx,
-                    HostTensor::<i32, m![First]>::from_vec(tap),
-                )?);
-            }
-            let mut conv2 = Vec::new();
-            for tap in offsets(1, Second::SIZE, EMPTY, pixel) {
-                conv2.push(HbmTensor::load(
-                    cx,
-                    HostTensor::<i32, m![Second]>::from_vec(tap),
-                )?);
-            }
-            let mut conv3 = Vec::new();
-            for tap in offsets(2, Third::SIZE, LIVE, pixel) {
-                conv3.push(HbmTensor::load(
-                    cx,
-                    HostTensor::<i32, m![Third]>::from_vec(tap),
-                )?);
-            }
-            let phases: Vec<i32> = (0..Times::SIZE)
-                .map(|row| ((row % TIMES[2]) * width) as i32)
-                .collect();
-            Ok::<_, LoadError>(Offsets {
-                conv1: conv1
-                    .try_into()
-                    .unwrap_or_else(|_| unreachable!("three taps")),
-                conv2: conv2
-                    .try_into()
-                    .unwrap_or_else(|_| unreachable!("nine taps")),
-                conv3: conv3
-                    .try_into()
-                    .unwrap_or_else(|_| unreachable!("nine taps")),
-                phases: HbmTensor::load(cx, HostTensor::<i32, m![Times]>::from_vec(phases))?,
-            })
+            Ok::<_, LoadError>((
+                Offsets::<Two>::load(cx)?,
+                Offsets::<Four>::load(cx)?,
+                Offsets::<Eight>::load(cx)?,
+            ))
         })?;
         let zero: HbmTensor<bf16, Chip, m![Channels]> = cx.field("zero", "", |cx| {
             let zeros = vec![bf16::from_f32(0.0); Channels::SIZE];
@@ -244,6 +259,49 @@ impl<'a> Load<&'a Checkpoint> for Frontend {
     }
 }
 
+impl<L: Launch> Offsets<L> {
+    /// The launch's offsets, built on host.
+    fn load(cx: &mut Context<'_>) -> Result<Self, LoadError> {
+        let (mel, pixel) = (
+            Mel::SIZE * size_of::<bf16>(),
+            Channels::SIZE * size_of::<bf16>(),
+        );
+        let width = Width::SIZE * size_of::<bf16>();
+        let mut conv1 = Vec::new();
+        for tap in frames(L::CHUNKS, L::First::SIZE, L::CHUNKS * FRAMES, mel) {
+            let tap = HostTensor::<i32, m![{ Symbol<L::First> }]>::from_vec(tap);
+            conv1.push(HbmTensor::load(cx, tap)?);
+        }
+        let mut conv2 = Vec::new();
+        for tap in offsets(L::CHUNKS, 1, L::Second::SIZE, L::EMPTY, pixel) {
+            let tap = HostTensor::<i32, m![{ Symbol<L::Second> }]>::from_vec(tap);
+            conv2.push(HbmTensor::load(cx, tap)?);
+        }
+        let mut conv3 = Vec::new();
+        for tap in offsets(L::CHUNKS, 2, Third::SIZE, L::LIVE, pixel) {
+            conv3.push(HbmTensor::load(
+                cx,
+                HostTensor::<i32, m![Third]>::from_vec(tap),
+            )?);
+        }
+        let phases: Vec<i32> = (0..Times::SIZE)
+            .map(|row| ((row % TIMES[2]) * width) as i32)
+            .collect();
+        Ok(Self {
+            conv1: conv1
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("three taps")),
+            conv2: conv2
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("nine taps")),
+            conv3: conv3
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("nine taps")),
+            phases: HbmTensor::load(cx, HostTensor::<i32, m![Times]>::from_vec(phases))?,
+        })
+    }
+}
+
 /// `Qwen3ASRAudioEncoderLayer`: pre-norm unmasked self attention of 16 heads of 64 features,
 /// every projection biased, then a pre-norm GELU feed-forward, each added to its input.
 #[derive(DeviceSend, Load)]
@@ -255,23 +313,58 @@ pub struct Layer {
     pub fc2: Biased<Intermediate, Width>,
 }
 
-/// The layer's attention: its query, key and value heads, head-major, and its output projection.
-#[derive(DeviceSend, Load)]
+/// The layer's attention: its query, key and value heads in one projection, `q_proj`'s, `k_proj`'s
+/// and `v_proj`'s rows one after another, head-major, so each projection's heads are a third of
+/// its output's storage; and its output projection.
+#[derive(DeviceSend)]
 pub struct SelfAttention {
-    pub q_proj: Heads,
-    pub k_proj: Heads,
-    pub v_proj: Heads,
+    pub qkv: Heads,
     pub out_proj: Biased<Inner, Width>,
 }
 
-/// A biased projection into head-major heads of 64 features.
-pub type Heads = PerHead<Width, Inner, Head, Chip>;
+/// A biased projection into head-major heads of 64 features: the queries', the keys' and the
+/// values' heads.
+pub type Heads = PerHead<Width, Fused, Head, Chip>;
+
+/// The query, key and value heads of a tile of rows, head-major, as [`Heads`] gives them.
+pub type FusedMajor =
+    HbmTensor<bf16, Chip, m![Fused / ({ Symbol<Head> }), Rows, Fused % ({ Symbol<Head> })]>;
+
+/// `q_proj`, `k_proj` and `v_proj`, each a weight and a bias, rows stacked.
+impl<'a> Load<&'a Checkpoint> for SelfAttention {
+    fn load(cx: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        let (width, inner) = (Width::SIZE, Inner::SIZE);
+        let mut weights = Vec::with_capacity(3 * inner * width);
+        let mut biases = Vec::with_capacity(3 * inner);
+        for name in ["q_proj", "k_proj", "v_proj"] {
+            let (weight, bias) = cx.field(name, name, |cx| {
+                let weight = cx.field("weight", "weight", |cx| cx.floats(from, &[inner, width]))?;
+                let bias = cx.field("bias", "bias", |cx| cx.floats(from, &[inner]))?;
+                Ok::<_, LoadError>((weight, bias))
+            })?;
+            weights.extend(weight.into_iter().map(bf16::from_f32));
+            biases.extend(bias);
+        }
+        let (weight, bias) = cx.field("qkv", "", |cx| {
+            let weight =
+                HbmTensor::load(cx, HostTensor::<bf16, m![Fused, Width]>::from_vec(weights))?;
+            let bias = HbmTensor::load(cx, HostTensor::<f32, m![Fused]>::from_vec(biases))?;
+            Ok::<_, LoadError>((weight, bias))
+        })?;
+        let out_proj = cx.field("out_proj", "out_proj", |cx| Biased::load(cx, from))?;
+        Ok(Self {
+            qkv: PerHead(Affine::new(weight, bias), PhantomData),
+            out_proj,
+        })
+    }
+}
 
 /// `nn.LayerNorm` of BF16 rows, epsilon 1e-5.
 pub type Norm = LayerNorm<HbmTensor<bf16, Chip, m![Width]>, HbmTensor<f32, Chip, m![1]>>;
 
 axes![
     Inner = 1024,
+    Fused = 3072,
     Intermediate = 4096,
     Projected = 1024,
     Text = 2048
@@ -455,16 +548,16 @@ impl<'x, Env> Module<(&'x Tile, &'x Tile, &'x Tile, &'x Visible<Chip>), Env, &mu
 pub type Major =
     HbmTensor<bf16, Chip, m![Inner / ({ Symbol<Head> }), Rows, Inner % ({ Symbol<Head> })]>;
 
-/// The byte offsets of the mel frames each of `conv2d1`'s three time taps reads, for a launch's
-/// output rows, one an output time: tap `kt` of time `y` of chunk `c` reads frame `2y + kt - 1` of
+/// The byte offsets of the mel frames each of `conv2d1`'s three time taps reads, for the output
+/// rows of a launch of `chunks` chunks, one an output time: tap `kt` of time `y` of chunk `c` reads frame `2y + kt - 1` of
 /// the chunk, or the zero frame `zero` outside it and past the launch's rows.
-pub fn frames(rows: usize, zero: usize, bytes: usize) -> [Vec<i32>; 3] {
+pub fn frames(chunks: usize, rows: usize, zero: usize, bytes: usize) -> [Vec<i32>; 3] {
     std::array::from_fn(|tap| {
         (0..rows)
             .map(|row| {
                 let (chunk, time) = (row / TIMES[0], row % TIMES[0]);
                 let at = match (2 * time + tap).checked_sub(1) {
-                    Some(frame) if chunk < CHUNKS && frame < FRAMES => chunk * FRAMES + frame,
+                    Some(frame) if chunk < chunks && frame < FRAMES => chunk * FRAMES + frame,
                     _ => zero,
                 };
                 (at * bytes) as i32
@@ -478,7 +571,13 @@ pub fn frames(rows: usize, zero: usize, bytes: usize) -> [Vec<i32>; 3] {
 /// `2y + kt - 1`, frequency `2x + kf - 1`), or the zero row `zero` outside the input; output rows
 /// past the launch's read the zero row. The rows are `(chunk, time, frequency)`-major, each
 /// `bytes` long.
-pub fn offsets(stage: usize, rows: usize, zero: usize, bytes: usize) -> [Vec<i32>; 9] {
+pub fn offsets(
+    chunks: usize,
+    stage: usize,
+    rows: usize,
+    zero: usize,
+    bytes: usize,
+) -> [Vec<i32>; 9] {
     let (inputs, outputs) = (
         (TIMES[stage - 1], FREQUENCIES[stage - 1]),
         (TIMES[stage], FREQUENCIES[stage]),
@@ -493,7 +592,7 @@ pub fn offsets(stage: usize, rows: usize, zero: usize, bytes: usize) -> [Vec<i32
                     .checked_sub(1)
                     .zip((2 * frequency + kf).checked_sub(1));
                 let at = match input {
-                    Some((t, f)) if chunk < CHUNKS && t < inputs.0 && f < inputs.1 => {
+                    Some((t, f)) if chunk < chunks && t < inputs.0 && f < inputs.1 => {
                         (chunk * inputs.0 + t) * inputs.1 + f
                     }
                     _ => zero,

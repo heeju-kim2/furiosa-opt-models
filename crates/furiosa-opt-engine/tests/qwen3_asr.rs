@@ -247,7 +247,7 @@ fn values(bytes: &[u8]) -> Vec<f32> {
 #[ignore = "opens a device"]
 fn embeds_the_clip_as_transformers() {
     use furiosa_opt_engine::vision_language::qwen3_asr::{self as engine, Embedded, Frames, Times};
-    use furiosa_opt_models::models::vision_language::qwen3_asr::audio::{Frontend, Width};
+    use furiosa_opt_models::models::vision_language::qwen3_asr::audio::{Eight, Frontend, Width};
     use furiosa_opt_std::prelude::{Pair, Symbol, m};
     let inputs = reference("inputs.safetensors");
     let inputs = SafeTensors::deserialize(&inputs).unwrap();
@@ -264,8 +264,9 @@ fn embeds_the_clip_as_transformers() {
     let (chunks, times, width) = (want.shape()[0], want.shape()[1], want.shape()[2]);
     let want = values(want.data());
     runtime().block_on(async {
-        let frames: Frames = upload(&mut device, &rows).await.try_into().unwrap();
-        let embedded: Embedded = engine::embed(&frontend, &mut device, &frames)
+        let frames: Frames<Eight> = upload(&mut device, &rows).await.try_into().unwrap();
+        let offsets = &frontend.offsets.2;
+        let embedded: Embedded = engine::embed(&frontend, &mut device, &frames, offsets)
             .await
             .unwrap();
         let got = embedded

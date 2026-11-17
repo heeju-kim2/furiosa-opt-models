@@ -7,9 +7,9 @@ use crate::registry::{Listed, Model};
 use crate::{AsyncModule, Function, forward};
 use furiosa_opt_models::load::{LoadError, Part};
 use furiosa_opt_models::models::vision_language::qwen3_asr::audio::{
-    self, Band, Bidirectional, CHUNKS, Channels, Clip, EMPTY, FRAMES, Filters, First, Flat,
-    Frontend, Intermediate, LIVE, Major, Mel, Pixels, Projected as Projected1, Rows, Second, TIMES,
-    Text, Third, Tile, Tower, Width,
+    self, Band, Bidirectional, CHUNKS, Channels, FRAMES, Filters, Flat, Frontend, FusedMajor,
+    Intermediate, Launch, Major, Mel, Offsets, Projected as Projected1, Rows, TIMES, Text, Third,
+    Tile, Tower, Width,
 };
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
 use furiosa_opt_models::ops::attention::single::Visible;
@@ -24,8 +24,8 @@ use std::pin::Pin;
 
 pub use furiosa_opt_models::models::vision_language::qwen3_asr::audio::Times;
 
-/// The launch's mel frames, `CHUNKS` chunks of 100 frames, then one zero frame.
-pub type Frames = HbmTensor<bf16, Chip, m![Clip, Mel]>;
+/// A launch's mel frames, its chunks of 100 frames, then one zero frame.
+pub type Frames<L> = HbmTensor<bf16, Chip, m![{ Symbol<<L as Launch>::Clip> }, Mel]>;
 
 /// Rows of the tower's width, one an output time, chunk-major.
 pub type Embedded = HbmTensor<bf16, Chip, m![Times, Width]>;
@@ -80,20 +80,22 @@ where
 
 /// The rows of a launch's `frames` after the convolutions, the flattening projection and the
 /// positions: output time `y` of chunk `c` at row `13 c + y`.
-pub async fn embed(
+pub async fn embed<L: Launch>(
     frontend: &Frontend,
     device: &mut Device,
-    frames: &Frames,
+    frames: &Frames<L>,
+    offsets: &Offsets<L>,
 ) -> io::Result<Embedded> {
-    let (offsets, pixel) = (&frontend.offsets, Channels::SIZE * size_of::<bf16>());
-    let first: HbmTensor<bf16, Chip, m![First, Band]> =
-        convolve::<Clip, First, Mel, Band>(device, frames, &offsets.conv1, &frontend.conv1).await?;
+    let pixel = Channels::SIZE * size_of::<bf16>();
+    let first: HbmTensor<bf16, Chip, m![{ Symbol<L::First> }, Band]> =
+        convolve::<L::Clip, L::First, Mel, Band>(device, frames, &offsets.conv1, &frontend.conv1)
+            .await?;
     // The last output time's first pixel reads as the zero row of the second convolution's taps.
     let first = first.into_buffer();
-    zero(device, &frontend.zero, &first, EMPTY * pixel)?;
-    let first: HbmTensor<bf16, Chip, m![Pixels, Channels]> = alias(&first, ..)?;
-    let second: HbmTensor<bf16, Chip, m![Second, Filters]> =
-        convolve::<Pixels, Second, Channels, Filters>(
+    zero(device, &frontend.zero, &first, L::EMPTY * pixel)?;
+    let first: HbmTensor<bf16, Chip, m![{ Symbol<L::Pixels> }, Channels]> = alias(&first, ..)?;
+    let second: HbmTensor<bf16, Chip, m![{ Symbol<L::Second> }, Filters]> =
+        convolve::<L::Pixels, L::Second, Channels, Filters>(
             device,
             &first,
             &offsets.conv2,
@@ -101,10 +103,10 @@ pub async fn embed(
         )
         .await?;
     let second = second.into_buffer();
-    zero(device, &frontend.zero, &second, LIVE * pixel)?;
-    let second: HbmTensor<bf16, Chip, m![Second, Filters]> = alias(&second, ..)?;
+    zero(device, &frontend.zero, &second, L::LIVE * pixel)?;
+    let second: HbmTensor<bf16, Chip, m![{ Symbol<L::Second> }, Filters]> = alias(&second, ..)?;
     let third: HbmTensor<bf16, Chip, m![Third, Channels]> =
-        convolve::<Second, Third, Filters, Channels>(
+        convolve::<L::Second, Third, Filters, Channels>(
             device,
             &second,
             &offsets.conv3,
@@ -138,10 +140,11 @@ fn recast<D: Scalar, A: M, B: M>(
 
 /// The tower's rows of a launch's `frames` in the text model's width, the first `live` of them a
 /// clip's: one attention window of the launch's rows, its rows past them zero.
-pub async fn encode(
+pub async fn encode<L: Launch>(
     tower: &Tower,
     device: &mut Device,
-    frames: &Frames,
+    frames: &Frames<L>,
+    offsets: &Offsets<L>,
     live: usize,
 ) -> io::Result<Projected> {
     if live > Times::SIZE {
@@ -150,7 +153,9 @@ pub async fn encode(
             "a clip's rows exceed one attention window",
         ));
     }
-    let embedded = embed(&tower.frontend, device, frames).await?.into_buffer();
+    let embedded = embed(&tower.frontend, device, frames, offsets)
+        .await?
+        .into_buffer();
     let row = Width::SIZE * size_of::<bf16>();
     let mut head = tower
         .tile
@@ -177,15 +182,17 @@ pub async fn encode(
         let normed: Hidden = Function::new(&layer.self_attn_layer_norm, forward)
             .forward(device, (), &mut (), &hidden)
             .await?;
-        let heads = async |device: &mut Device, projection| -> io::Result<Tile> {
-            let major: Major = Function::new(projection, forward)
-                .forward(device, (), &mut (), &normed)
-                .await?;
+        // The query, key and value heads in one launch, each a third of its storage.
+        let fused: FusedMajor = Function::new(&attention.qkv, forward)
+            .forward(device, (), &mut (), &normed)
+            .await?;
+        let fused = fused.into_buffer();
+        let third = FusedMajor::size() / 3;
+        let heads = |at: usize| -> io::Result<Tile> {
+            let major: Major = alias(&fused, at * third..(at + 1) * third)?;
             recast(major)
         };
-        let query = heads(device, &attention.q_proj).await?;
-        let key = heads(device, &attention.k_proj).await?;
-        let value = heads(device, &attention.v_proj).await?;
+        let (query, key, value) = (heads(0)?, heads(1)?, heads(2)?);
         let attended: Tile = Function::new(&Bidirectional, forward)
             .forward(device, (), &mut (), (&query, &key, &value, &visible))
             .await?;
@@ -227,6 +234,28 @@ pub async fn encode(
         .await
 }
 
+/// The tower's rows of a clip of `count` frames, `frames`, in a launch `L` of the fewest chunks
+/// that hold them: its frames copied into the launch's zero frames.
+async fn launch<L: Launch>(
+    tower: &Tower,
+    device: &mut Device,
+    frames: &HbmBuffer,
+    count: usize,
+    offsets: &Offsets<L>,
+    live: usize,
+) -> io::Result<Projected> {
+    let mel = Mel::SIZE * size_of::<bf16>();
+    let buffer = HostBufferSlice::from(&vec![0u8; L::Clip::SIZE * mel][..])
+        .to_hbm(&mut device.pdma)
+        .await
+        .map_err(io::Error::other)?;
+    if count > 0 {
+        let mut target = buffer.alias(..count * mel).map_err(io::Error::other)?;
+        copy(&mut *device, [(frames, &mut target)])?;
+    }
+    encode(tower, device, &alias(&buffer, ..)?, offsets, live).await
+}
+
 /// Rows of a clip after the convolutions: a chunk's 13 for every whole chunk, and the rows three
 /// halvings leave of the last chunk's frames, as Transformers counts them.
 pub fn rows(frames: usize) -> usize {
@@ -255,7 +284,8 @@ impl Listed for Tower {
     }
 }
 
-/// Each clip of at most 8 s, 800 mel frames of 128 features, alone in a launch.
+/// Each clip in windows of 8 s, 800 mel frames of 128 features, each window alone in a launch, as
+/// Transformers attends them apart.
 impl Encoder for Tower {
     fn vision<'a>(
         &'a self,
@@ -276,31 +306,40 @@ impl Encoder for Tower {
         clips: &'a [Audio],
     ) -> Pin<Box<dyn Future<Output = io::Result<Vec<DecoderTensor>>> + Send + 'a>> {
         Box::pin(async move {
-            let mel = Mel::SIZE * size_of::<bf16>();
             let mut embedded = Vec::with_capacity(clips.len());
+            let (mel, text) = (
+                Mel::SIZE * size_of::<bf16>(),
+                Text::SIZE * size_of::<bf16>(),
+            );
+            let window = CHUNKS * FRAMES;
             for clip in clips {
                 let frames = clip.frames::<m![Mel]>()?;
                 let count = frames.len();
-                if count > CHUNKS * FRAMES {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!(
-                            "a clip of {count} frames exceeds a launch's {}",
-                            CHUNKS * FRAMES
-                        ),
-                    ));
+                // Transformers attends each window of 8 s apart, its rows a launch's; the clip's
+                // rows are each window's live rows in order.
+                let total = rows(count);
+                let output =
+                    HbmBuffer::alloc(device, total.max(1) * text).map_err(io::Error::other)?;
+                let mut written = 0;
+                for start in (0..count).step_by(window) {
+                    let end = count.min(start + window);
+                    let part = (frames.buffer().alias(start * mel..end * mel))
+                        .map_err(io::Error::other)?;
+                    let (count, live) = (end - start, rows(end - start));
+                    let offsets = &self.frontend.offsets;
+                    let tile = match count.div_ceil(FRAMES) {
+                        0..=2 => launch(self, &mut *device, &part, count, &offsets.0, live).await?,
+                        3..=4 => launch(self, &mut *device, &part, count, &offsets.1, live).await?,
+                        _ => launch(self, &mut *device, &part, count, &offsets.2, live).await?,
+                    };
+                    let tile = tile.into_buffer();
+                    let source = tile.alias(..live * text).map_err(io::Error::other)?;
+                    let mut target = (output.alias(written * text..(written + live) * text))
+                        .map_err(io::Error::other)?;
+                    copy(&mut *device, [(&source, &mut target)])?;
+                    written += live;
                 }
-                let launch = HostBufferSlice::from(&vec![0u8; Clip::SIZE * mel][..])
-                    .to_hbm(&mut device.pdma)
-                    .await
-                    .map_err(io::Error::other)?;
-                if count > 0 {
-                    let mut target = launch.alias(..count * mel).map_err(io::Error::other)?;
-                    copy(&mut *device, [(frames.buffer(), &mut target)])?;
-                }
-                let live = rows(count);
-                let tile = encode(self, &mut *device, &alias(&launch, ..)?, live).await?;
-                let rows = DecoderRows::<bf16, m![Text]>::new(&tile.into_buffer(), 0..live)?;
+                let rows = DecoderRows::<bf16, m![Text]>::new(&output, 0..total)?;
                 embedded.push(DecoderTensor::try_from(rows)?);
             }
             Ok(embedded)
