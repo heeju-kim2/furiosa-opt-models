@@ -28,11 +28,25 @@ pub enum Activation {
 #[derive(Default, Clone, Copy, DeviceSend, Load)]
 pub struct Relu;
 
-impl<D: Scalar, S: M, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> for Relu {
+impl<D: Float, S: M + 'static, Chips: M + 'static> Op<&HbmTensor<D, Chips, S>> for Relu {
     type Output = HbmTensor<D, Chips, S>;
 
-    fn forward(&self, _: &mut Device, _: &HbmTensor<D, Chips, S>) -> Self::Output {
-        todo!("NPU rectified linear unit")
+    /// Each window raised to zero in FP32, in one DM round trip.
+    fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
+        Window::<S>::map(device, input, |device, input| {
+            device
+                .main
+                .begin(input.view())
+                .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+                .fetch_cast::<f32>()
+                .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_clip(ClipBinaryOpF32::Max, 0.0)
+                .vector_final()
+                .commit_trim::<m![{ Width<S> } % 8]>()
+                .commit()
+        })
     }
 }
 
@@ -231,6 +245,89 @@ impl<D: Float, S: M + 'static, Chips: M> Op<&HbmTensor<D, Chips, S>> for Sigmoid
         Window::<S>::map(device, input, |device, input| {
             Window::<S>::stream(&mut device.main, &input)
                 .vector_fp_unary(FpUnaryOp::Sigmoid)
+                .vector_widen_concat::<
+                    m![{ Width<S> } % ({ Segment<S> }) / 8],
+                    m![{ Width<S> } % 8],
+                >()
+                .vector_final()
+                .commit_trim::<m![{ Width<S> } % 8]>()
+                .commit()
+        })
+    }
+}
+
+/// `exp(x)`, preserving any input chip mapping.
+#[derive(Clone, Copy, Default, DeviceSend, Load)]
+pub struct Exp;
+
+impl<D: Float, S: M + 'static, Chips: M> Op<&HbmTensor<D, Chips, S>> for Exp {
+    type Output = HbmTensor<D, Chips, S>;
+
+    fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
+        Window::<S>::map(device, input, |device, input| {
+            Window::<S>::stream(&mut device.main, &input)
+                .vector_fp_unary(FpUnaryOp::Exp)
+                .vector_widen_concat::<
+                    m![{ Width<S> } % ({ Segment<S> }) / 8],
+                    m![{ Width<S> } % 8],
+                >()
+                .vector_final()
+                .commit_trim::<m![{ Width<S> } % 8]>()
+                .commit()
+        })
+    }
+}
+
+/// `exp(min(x, 0)) - 1`, ELU's part below zero, whose sum with [`Relu`]'s is ELU: `min(x, 0)`,
+/// then its exponential less one, in two DM round trips, as the exponential of a large input
+/// leaves FP32.
+#[derive(Clone, Copy, Default, DeviceSend, Load)]
+pub struct ExpBelow;
+
+impl<D: Float, S: M + 'static, Chips: M> Op<&HbmTensor<D, Chips, S>> for ExpBelow {
+    type Output = HbmTensor<D, Chips, S>;
+
+    fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
+        let below = Window::<S>::map(device, input, |device, input| {
+            device
+                .main
+                .begin(input.view())
+                .fetch::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+                .fetch_cast::<f32>()
+                .collect::<m![{ Width<S> } % ({ Segment<S> }) / 8], m![{ Width<S> } % 8]>()
+                .vector_init()
+                .vector_intra_slice_tag(TagMode::Zero)
+                .vector_clip(ClipBinaryOpF32::Min, 0.0)
+                .vector_final()
+                .commit_trim::<m![{ Width<S> } % 8]>()
+                .commit()
+        });
+        Window::<S>::map(device, &below, |device, input| {
+            Window::<S>::stream(&mut device.main, &input)
+                .vector_fp_unary(FpUnaryOp::Exp)
+                .vector_fp_binary(FpBinaryOp::AddF, -1.0_f32)
+                .vector_widen_concat::<
+                    m![{ Width<S> } % ({ Segment<S> }) / 8],
+                    m![{ Width<S> } % 8],
+                >()
+                .vector_final()
+                .commit_trim::<m![{ Width<S> } % 8]>()
+                .commit()
+        })
+    }
+}
+
+/// `sqrt(x)`, preserving any input chip mapping.
+#[derive(Clone, Copy, Default, DeviceSend, Load)]
+pub struct Sqrt;
+
+impl<D: Float, S: M + 'static, Chips: M> Op<&HbmTensor<D, Chips, S>> for Sqrt {
+    type Output = HbmTensor<D, Chips, S>;
+
+    fn forward(&self, device: &mut Device, input: &HbmTensor<D, Chips, S>) -> Self::Output {
+        Window::<S>::map(device, input, |device, input| {
+            Window::<S>::stream(&mut device.main, &input)
+                .vector_fp_unary(FpUnaryOp::Sqrt)
                 .vector_widen_concat::<
                     m![{ Width<S> } % ({ Segment<S> }) / 8],
                     m![{ Width<S> } % 8],

@@ -1,6 +1,6 @@
 //! Elementwise sums, in FP32 and rounded once.
 
-use super::{Flat, Float, Window};
+use super::{Binary, Flat, Float, Window};
 use crate::Op;
 use crate::load::Load;
 use crate::modules::generic::schedule::{Fill, IntoStream, Slot, Spill, Stream};
@@ -70,7 +70,7 @@ impl<D: Float, S: M + 'static, Chips: M> Op<(&HbmTensor<D, Chips, S>, &HbmTensor
         device: &mut Device,
         (left, right): (&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>),
     ) -> Self::Output {
-        Window::<S>::combine::<_, false, Chips>(device, left, right)
+        Window::<S>::combine::<_, { Binary::Add }, Chips>(device, left, right)
     }
 }
 

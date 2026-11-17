@@ -3,7 +3,7 @@
 
 use super::{Audio, Encoder, Image};
 use crate::decoder::{HbmTensor as DecoderTensor, Rows as DecoderRows};
-use crate::registry::{Listed, Model};
+use crate::registry::{Listed, Model, Role};
 use crate::{AsyncModule, Function, forward};
 use furiosa_opt_models::load::{LoadError, Part};
 use furiosa_opt_models::models::vision_language::qwen3_asr::audio::{
@@ -269,6 +269,8 @@ pub fn rows(frames: usize) -> usize {
 
 /// The tower reads a load of the encoder part alone and serves audio.
 impl Listed for Tower {
+    const ROLE: Role = Role::Encoder;
+
     fn reads(part: Part) -> Result<(), LoadError> {
         match part {
             Part::Encoder => Ok(()),

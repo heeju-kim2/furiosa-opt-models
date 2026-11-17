@@ -40,6 +40,33 @@ impl<M, F> Function<M, F> {
     pub fn new(module: M, entry: F) -> Self {
         Self { module, entry }
     }
+
+    /// Launches the computation of `input` into `output`, storage the caller holds, such as rows
+    /// of a larger buffer a later launch reads around; returns once the runtime accepted the
+    /// launch, as [`AsyncModule::forward`] does.
+    pub fn forward_into<I, E, S, O>(
+        &self,
+        device: &mut Device,
+        env: E,
+        state: S,
+        input: I,
+        output: &mut O,
+    ) -> io::Result<()>
+    where
+        M: DeviceSend + Module<I, E, S, Output = O> + Sync,
+        I: DeviceSend + Send,
+        E: DeviceSend + Send,
+        S: DeviceSend + Send,
+        O: DeviceOutput,
+        F: Copy + Sync + for<'d, 'm> DeviceFn<(&'d mut Device, &'m M, E, S, I), Output = O>,
+    {
+        launch(self.entry, (device, &self.module, env, state, input))
+            .output(output)
+            .submit()
+            .accepted()
+            .map(drop)
+            .map_err(io::Error::other)
+    }
 }
 
 impl<M, F, I, E, S, O> AsyncModule<I, E, S> for Function<M, F>
@@ -57,12 +84,7 @@ where
         // The output takes new memory before the launch, as a launch into returned storage does,
         // so the call returns it at acceptance instead of at completion.
         let mut output = O::alloc(device).map_err(io::Error::other)?;
-        launch(self.entry, (device, &self.module, env, state, input))
-            .output(&mut output)
-            .submit()
-            .accepted()
-            .map(drop)
-            .map_err(io::Error::other)?;
+        self.forward_into(device, env, state, input, &mut output)?;
         Ok(output)
     }
 }

@@ -13,7 +13,8 @@ use super::vision_language::{Audio, Image};
 use super::{Context, Error, Shared};
 use furiosa_opt_engine as engine;
 use furiosa_opt_engine::decoder::Served;
-use furiosa_opt_engine::registry::Model;
+use furiosa_opt_engine::registry::{Model, Role};
+use furiosa_opt_engine::speech;
 use furiosa_opt_engine::vision_language;
 use furiosa_opt_models::load::{LoadError, Part};
 use furiosa_opt_models::models::Class;
@@ -196,15 +197,15 @@ impl LoadOptions {
     }
 
     /// Load the model `checkpoint` selects strictly into HBM of `device`: a decoder, as an object of
-    /// its model type's class such as `qwen3.ForCausalLM`, or an `Encoder` for a load of the media
-    /// encoder alone. Dropping the object frees its device memory, and a new load of the same
-    /// model serves the caches the dropped one did.
+    /// its model type's class such as `qwen3.ForCausalLM`, an `Encoder` for a load of the media
+    /// encoder alone, or a `Vocoder` for a speech decoder. Dropping the object frees its device
+    /// memory, and a new load of the same model serves the caches the dropped one did.
     ///
     /// Raises:
     ///     ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
     ///     NotImplementedError: As `parse` does, or no class holds the model yet.
     ///     RuntimeError: The device fails.
-    #[gen_stub(override_return_type(type_repr = "Decoder | Encoder"))]
+    #[gen_stub(override_return_type(type_repr = "Decoder | Encoder | Vocoder"))]
     fn load(
         &self,
         py: Python<'_>,
@@ -217,9 +218,11 @@ impl LoadOptions {
             name: config.architecture().into(),
             reason: "no Python class holds the model yet".into(),
         };
-        let class = match config.part() {
-            Part::Encoder => None,
-            Part::Whole => Some(Decoder::class(config.class()).ok_or_else(unbound)?),
+        let class = match (config.part(), config.role()) {
+            (Part::Encoder, _) | (_, Role::Encoder | Role::Vocoder) => None,
+            (Part::Whole, Role::Decoder) => {
+                Some(Decoder::class(config.class()).ok_or_else(unbound)?)
+            }
         };
         let model = py.detach(|| {
             let mut context = device.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -238,9 +241,12 @@ impl LoadOptions {
             (Model::Encoder(encoder), None) => {
                 Py::new(py, Encoder { encoder, context })?.into_any()
             }
-            _ => {
-                unreachable!("a load of the encoder alone serves a media encoder, others a decoder")
+            (Model::Vocoder(vocoder), None) => {
+                Py::new(py, Vocoder { vocoder, context })?.into_any()
             }
+            _ => unreachable!(
+                "a decoder's load finds its class, a media encoder's or speech decoder's none"
+            ),
         })
     }
 }
@@ -355,6 +361,74 @@ impl Decoder {
     ) -> Result<HbmTensor, Error> {
         let adapters = adapters.unwrap_or_default();
         decoder::forward(py, &*self.served, &self.context, cache, requests, adapters)
+    }
+}
+
+/// A speech decoder loaded on a device, whatever its model: its calls turn codec frames, an entry of
+/// each codebook a frame, into waveform samples.
+#[gen_stub_pyclass]
+#[pyclass(frozen, module = "engine")]
+pub(super) struct Vocoder {
+    vocoder: Box<dyn speech::Vocoder>,
+    context: Shared,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl Vocoder {
+    /// The codebooks of a frame.
+    #[getter]
+    fn groups(&self) -> usize {
+        self.vocoder.groups()
+    }
+
+    /// The entries of each codebook.
+    #[getter]
+    fn entries(&self) -> usize {
+        self.vocoder.entries()
+    }
+
+    /// The samples a frame decodes into.
+    #[getter]
+    fn samples(&self) -> usize {
+        self.vocoder.samples()
+    }
+
+    /// The samples a second holds.
+    #[getter]
+    fn rate(&self) -> usize {
+        self.vocoder.rate()
+    }
+
+    /// The samples of `codes`, one row of `groups` codebook entries a frame, as FP32 at `rate`:
+    /// `samples` a frame, returned on the host once the device decoded them.
+    ///
+    /// Raises:
+    ///     ValueError: A frame holds another count of entries, or an entry lies outside its
+    ///         codebook.
+    ///     RuntimeError: The device fails.
+    #[gen_stub(override_return_type(type_repr = "numpy.typing.NDArray[numpy.float32]", imports = ("numpy", "numpy.typing")))]
+    fn decode(
+        &self,
+        py: Python<'_>,
+        #[gen_stub(override_type(type_repr = "collections.abc.Sequence[collections.abc.Sequence[int]]", imports = ("collections.abc",)))]
+        codes: Vec<Vec<i32>>,
+    ) -> Result<Py<PyAny>, Error> {
+        let groups = self.vocoder.groups();
+        if codes.iter().any(|frame| frame.len() != groups) {
+            return Err(
+                PyValueError::new_err(format!("a frame holds {groups} codebook entries")).into(),
+            );
+        }
+        let flat: Vec<i32> = codes.into_iter().flatten().collect();
+        let samples = py.detach(|| {
+            let mut shared = self.context.lock().unwrap_or_else(PoisonError::into_inner);
+            let Context { device, runtime } = &mut *shared;
+            runtime.block_on(self.vocoder.decode(device, &flat))
+        })?;
+        Ok(numpy::IntoPyArray::into_pyarray(samples, py)
+            .into_any()
+            .unbind())
     }
 }
 

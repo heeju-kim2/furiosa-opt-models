@@ -25,6 +25,7 @@ __all__ = [
     "LoadOptions",
     "Placement",
     "Transfer",
+    "Vocoder",
     "decoder",
     "llama",
     "mistral",
@@ -474,12 +475,12 @@ class LoadOptions:
                 checkpoint, or a quantized checkpoint is given a quantization.
             NotImplementedError: The list refuses the architecture, or a choice.
         """
-    def load(self, checkpoint: Checkpoint, device: Device) -> Decoder | Encoder:
+    def load(self, checkpoint: Checkpoint, device: Device) -> Decoder | Encoder | Vocoder:
         r"""
         Load the model `checkpoint` selects strictly into HBM of `device`: a decoder, as an object of
-        its model type's class such as `qwen3.ForCausalLM`, or an `Encoder` for a load of the media
-        encoder alone. Dropping the object frees its device memory, and a new load of the same
-        model serves the caches the dropped one did.
+        its model type's class such as `qwen3.ForCausalLM`, an `Encoder` for a load of the media
+        encoder alone, or a `Vocoder` for a speech decoder. Dropping the object frees its device
+        memory, and a new load of the same model serves the caches the dropped one did.
 
         Raises:
             ValueError: As `parse` does, or a tensor is missing, unexpected or malformed.
@@ -523,4 +524,43 @@ class Transfer:
 
         Raises:
             RuntimeError: The copy failed.
+        """
+
+@typing.final
+class Vocoder:
+    r"""
+    A speech decoder loaded on a device, whatever its model: its calls turn codec frames, an entry of
+    each codebook a frame, into waveform samples.
+    """
+    @property
+    def groups(self) -> builtins.int:
+        r"""
+        The codebooks of a frame.
+        """
+    @property
+    def entries(self) -> builtins.int:
+        r"""
+        The entries of each codebook.
+        """
+    @property
+    def samples(self) -> builtins.int:
+        r"""
+        The samples a frame decodes into.
+        """
+    @property
+    def rate(self) -> builtins.int:
+        r"""
+        The samples a second holds.
+        """
+    def decode(
+        self, codes: collections.abc.Sequence[collections.abc.Sequence[int]]
+    ) -> numpy.typing.NDArray[numpy.float32]:
+        r"""
+        The samples of `codes`, one row of `groups` codebook entries a frame, as FP32 at `rate`:
+        `samples` a frame, returned on the host once the device decoded them.
+
+        Raises:
+            ValueError: A frame holds another count of entries, or an entry lies outside its
+                codebook.
+            RuntimeError: The device fails.
         """

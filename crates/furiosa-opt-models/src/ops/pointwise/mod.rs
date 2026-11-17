@@ -5,7 +5,7 @@ use crate::load::Load;
 use crate::ops::normalization::Chunk;
 use crate::specialize::pointwise;
 use furiosa_opt_std::prelude::*;
-use std::marker::PhantomData;
+use std::marker::{ConstParamTy, PhantomData};
 
 pub mod activation;
 pub mod add;
@@ -158,6 +158,38 @@ impl<S: M + 'static> Window<S> {
         unsafe { result.reshape() }
     }
 
+    /// `input` window by window in FP32 in DM, rounded once to `O` on its way back: exact from
+    /// BF16 to FP32.
+    pub(in crate::ops) fn cast<I: Float, O: Float, Chips: M>(
+        device: &mut Device,
+        input: &HbmTensor<I, Chips, S>,
+    ) -> HbmTensor<O, Chips, S> {
+        const { assert!(S::SIZE > 1, "a cast of more than one element") };
+        let mut result = HbmTensor::<O, Chips, m![{ Symbol<Flat<S>> }]>::new();
+        for index in 0..S::SIZE / Window::<Width<S>>::SIZE {
+            let input: Rows<I, S, Chips> =
+                unsafe { input.view().reshape::<Chips, m![{ Symbol<Flat<S>> }]>() }
+                    .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, Batch<S>>(index)
+                    .to_dm(&mut device.tdma);
+            let output: Rows<f32, S, Chips> = Window::<S>::stream(&mut device.main, &input)
+                .vector_widen_concat::<
+                    m![{ Width<S> } % ({ Segment<S> }) / 8],
+                    m![{ Width<S> } % 8],
+                >()
+                .vector_final()
+                .commit_trim::<m![{ Width<S> } % 8]>()
+                .commit();
+            O::narrow(device, output).view().to_hbm_view(
+                &mut device.tdma,
+                result
+                    .view_mut()
+                    .tile::<m![{ Width<S> } / ({ Extent<S> })], 1, BatchMut<S>>(index),
+            );
+        }
+        // SAFETY: flattening preserves the contiguous element order.
+        unsafe { result.reshape() }
+    }
+
     /// Each window's values in FP32, and the same values narrowed to four lanes, as the stream a
     /// formula computes in.
     fn stream<'l, D: Float, Chips: M>(
@@ -185,8 +217,17 @@ impl<S: M + 'static> Window<S> {
     }
 }
 
+/// The elementwise operation of two tensors a window combines them with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ConstParamTy)]
+pub(in crate::ops) enum Binary {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
 impl<S: M + 'static> Window<S> {
-    pub(in crate::ops) fn combine<D: Float, const MULTIPLY: bool, Chips: M>(
+    pub(in crate::ops) fn combine<D: Float, const OP: Binary, Chips: M>(
         device: &mut Device,
         lhs: &HbmTensor<D, Chips, S>,
         rhs: &HbmTensor<D, Chips, S>,
@@ -216,10 +257,11 @@ impl<S: M + 'static> Window<S> {
             .vector_intra_slice_tag(TagMode::Zero)
             .vector_narrow_split::<m![{ Width<S> } % ({ Segment<S> }) / 4], m![{ Width<S> } % 4]>()
             .vector_fp_binary(
-                if MULTIPLY {
-                    FpBinaryOp::MulF(FpMulAlu::Mul0)
-                } else {
-                    FpBinaryOp::AddF
+                match OP {
+                    Binary::Add => FpBinaryOp::AddF,
+                    Binary::Subtract => FpBinaryOp::SubF,
+                    Binary::Multiply => FpBinaryOp::MulF(FpMulAlu::Mul0),
+                    Binary::Divide => FpBinaryOp::DivF,
                 },
                 &rhs,
             )

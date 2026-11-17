@@ -4,7 +4,7 @@
 
 use super::{Audio, Encoder, Image, launches};
 use crate::decoder::{HbmTensor, Rows};
-use crate::registry::{Listed, Model};
+use crate::registry::{Listed, Model, Role};
 use crate::{AsyncModule, Function, forward};
 use furiosa_opt_models::load::{Context, Load, LoadError, Part};
 use furiosa_opt_models::models::vision_language::gemma4_unified::{
@@ -22,6 +22,8 @@ axes![Short = 512, Long = 2304];
 /// The media encoder reads a load of the encoder part alone, and serves media; its rows are
 /// computed alone, so no tiling applies to them.
 impl Listed for gemma4_unified::Encoder<Hbm> {
+    const ROLE: Role = Role::Encoder;
+
     fn reads(part: Part) -> Result<(), LoadError> {
         match part {
             Part::Encoder => Ok(()),

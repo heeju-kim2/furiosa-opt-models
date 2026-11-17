@@ -68,6 +68,27 @@ impl<Chips: M, K: M, S: M, E: M + 'static> Op<DmTensor<bf16, Chips, K, S, E>> fo
     }
 }
 
+/// An HBM tensor's elements in the float type `D`: widened exactly from BF16 to FP32, or rounded
+/// once to the nearest BF16, every axis kept.
+#[derive(Clone, Copy, DeviceSend, Load)]
+pub struct Cast<D>(PhantomData<D>);
+
+impl<D> Default for Cast<D> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<I: super::Float, D: super::Float, S: M + 'static, Chips: M> Op<&HbmTensor<I, Chips, S>>
+    for Cast<D>
+{
+    type Output = HbmTensor<D, Chips, S>;
+
+    fn forward(&self, device: &mut Device, input: &HbmTensor<I, Chips, S>) -> Self::Output {
+        super::Window::<S>::cast(device, input)
+    }
+}
+
 pub(crate) fn convert<In, Out, Chips: M, K: M, S: M, E: M + 'static>(
     device: &mut Device,
     input: DmTensor<In, Chips, K, S, E>,

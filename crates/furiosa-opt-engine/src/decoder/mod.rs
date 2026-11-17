@@ -25,6 +25,7 @@ mod qwen3;
 pub use adapters::{Adapter, Binding, Loader, SLOTS};
 pub use batch::{Batch, Rows, Staged, Table};
 pub use cache::{Cache, CacheSpec, Group, Kind, Pool};
+pub use qwen3::{Sampling, Scoring, Speaking};
 
 use crate::{AsyncModule, Checkpoint, LoadError};
 use furiosa_opt_models::ops::attention::full::paged::Tiling;
@@ -246,6 +247,9 @@ impl<'r, 'c, 'l, 'a, D: Decoder>
 pub trait Served: Send + Sync {
     fn limits(&self) -> Limits;
 
+    /// The served instance itself, for a framework that calls its model's own methods.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// What a call returns of each kept row.
     fn output(&self) -> Output;
 
@@ -267,9 +271,13 @@ pub trait Served: Send + Sync {
 
 /// An instance serves as itself, its call's rows erased to their dtype and its adapters to
 /// `Adapter`s.
-impl<D: Decoder> Served for Instance<D> {
+impl<D: Decoder + 'static> Served for Instance<D> {
     fn limits(&self) -> Limits {
         Decoder::limits(&self.decoder)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn output(&self) -> Output {

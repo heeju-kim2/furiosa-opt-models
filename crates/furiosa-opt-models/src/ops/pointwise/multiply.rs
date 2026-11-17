@@ -1,7 +1,8 @@
 //! Elementwise products: of two tensors, of a tensor and a scalar, and of rows and per-row scalars.
 
 use super::{
-    Batch, BatchMut, Extent, Float, Rows, Segment, Slices, SpreadPacket, SpreadTime, Width, Window,
+    Batch, BatchMut, Binary, Extent, Float, Rows, Segment, Slices, SpreadPacket, SpreadTime, Width,
+    Window,
 };
 use crate::Op;
 use crate::load::Load;
@@ -37,7 +38,43 @@ impl<D: Float, S: M + 'static, Chips: M> Op<(&HbmTensor<D, Chips, S>, &HbmTensor
         device: &mut Device,
         (left, right): (&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>),
     ) -> Self::Output {
-        Window::<S>::combine::<_, true, Chips>(device, left, right)
+        Window::<S>::combine::<_, { Binary::Multiply }, Chips>(device, left, right)
+    }
+}
+
+/// Elementwise difference of tensors with identical chip and element mappings, in FP32.
+#[derive(Default, DeviceSend, Load)]
+pub struct Subtract;
+
+impl<D: Float, S: M + 'static, Chips: M> Op<(&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>)>
+    for Subtract
+{
+    type Output = HbmTensor<D, Chips, S>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (left, right): (&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>),
+    ) -> Self::Output {
+        Window::<S>::combine::<_, { Binary::Subtract }, Chips>(device, left, right)
+    }
+}
+
+/// Elementwise quotient of tensors with identical chip and element mappings, in FP32.
+#[derive(Default, DeviceSend, Load)]
+pub struct Divide;
+
+impl<D: Float, S: M + 'static, Chips: M> Op<(&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>)>
+    for Divide
+{
+    type Output = HbmTensor<D, Chips, S>;
+
+    fn forward(
+        &self,
+        device: &mut Device,
+        (left, right): (&HbmTensor<D, Chips, S>, &HbmTensor<D, Chips, S>),
+    ) -> Self::Output {
+        Window::<S>::combine::<_, { Binary::Divide }, Chips>(device, left, right)
     }
 }
 

@@ -117,6 +117,7 @@ impl<const N: &'static str> Front for Size<N> {
     type Heads<Projection, Norm> = Projection;
     type HeadNorm<Norm> = ();
     type Table<Table> = Named<"embed_tokens", Table>;
+    type Tokens<Vocabulary: AxisName> = Vocabulary;
 }
 
 /// What a Llama checkpoint's config declares that its size fixes, and the features the sizes do

@@ -23,6 +23,7 @@ mod function;
 pub mod decoder;
 pub mod load;
 pub mod registry;
+pub mod speech;
 pub mod vision_language;
 
 pub use function::{AsyncModule, Function, forward};

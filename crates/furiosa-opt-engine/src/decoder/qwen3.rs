@@ -17,7 +17,10 @@
 //!   key and value rows out head-major, and a channel-scaled projection adds no update.
 
 use super::adapters::{self, SLOTS};
-use super::{Batch, CacheSpec, Decoder, Group, Instance, Kind, Limits, Output, Pool, Rows, Table};
+use super::{
+    Batch, Cache, CacheSpec, Decoder, Group, Instance, Keep, Kind, Limits, Output, Pool, Request,
+    Rows, Table,
+};
 use crate::{AsyncModule, Checkpoint, Function, LoadError, forward};
 use furiosa_opt_models::load::{Context, Load, Named, Part};
 use furiosa_opt_models::models::decoder::attention::qwen3::{fp8, launch};
@@ -39,6 +42,7 @@ use furiosa_opt_models::ops::linear::Affine;
 use furiosa_opt_models::ops::linear::affine::{self, Columns};
 use furiosa_opt_models::specialize::attention::{Decode, WAVES};
 use furiosa_opt_models::tensor::axis;
+use furiosa_opt_models::tensor::axis::Sixteen;
 use furiosa_opt_models::tensor::cache::{self, Block as CacheBlock, Blocks};
 use furiosa_opt_models::tensor::mapping::Packets;
 use furiosa_opt_models::tensor::memory::{Hbm, alias};
@@ -134,6 +138,36 @@ macro_rules! greedy {
         let head = Function::new(&head, forward);
         let tokens = head.forward($device, (), &mut (), &mut rows).await?;
         Rows::new(&tokens.into_buffer(), 0..$kept.len())
+    }};
+}
+
+/// The FP32 scores of the kept rows `$kept`, of `$hidden` features, by the head `$head` onto
+/// `$vocabulary` with its bias: the rows in a block of the projection's rows, projected unrounded.
+macro_rules! scored {
+    ($hidden:ty, $vocabulary:ty, $head:expr, $device:ident, $kept:ident) => {{
+        type W = $hidden;
+        type V = $vocabulary;
+        let other = io::Error::other;
+        let count = $kept.len();
+        let row = Rows::<bf16, Symbol<W>>::bytes();
+        if count == 0 {
+            let empty = HbmBuffer::alloc($device, Rows::<f32, m![V]>::bytes()).map_err(other)?;
+            return Rows::new(&empty, 0..0);
+        }
+        let block = HbmBuffer::alloc($device, Block::SIZE * row).map_err(other)?;
+        let mut target = block.alias(..count * row).map_err(other)?;
+        let source = $kept.buffer().alias(..count * row).map_err(other)?;
+        ops_copy($device, [(&source, &mut target)])?;
+        let rows: HbmTensor<bf16, Chip, m![Block, W]> = alias(&block, ..)?;
+        let head = $head;
+        let projection = furiosa_opt_models::ops::linear::Unrounded::<W, V, Chip, _, _>(
+            Affine::new(&head.weight, &head.bias),
+            PhantomData,
+        );
+        let scores: HbmTensor<f32, Chip, m![Block, V]> = Function::new(&projection, forward)
+            .forward($device, (), &mut (), &rows)
+            .await?;
+        Rows::new(&scores.into_buffer(), 0..count)
     }};
 }
 
@@ -508,6 +542,20 @@ impl Decoder for Overriding<CodePredictor> {
         batch: Batch<'_, Self::Adapter>,
         tiling: Tiling,
     ) -> io::Result<Rows<i32, m![1]>> {
+        let (step, kept) = self.predict(device, layers, batch, tiling).await?;
+        greedy!(Predictor, &self.decoder.lm_head[step - 1], device, kept)
+    }
+}
+
+impl Overriding<CodePredictor> {
+    /// The kept rows' hidden values and the position they share, whose entry they pick.
+    async fn predict(
+        &self,
+        device: &mut Device,
+        layers: &mut <Self as Decoder>::Layers,
+        batch: Batch<'_, <Self as Decoder>::Adapter>,
+        tiling: Tiling,
+    ) -> io::Result<(usize, Rows<bf16, Symbol<<Predictor as Geometry>::Hidden>>)> {
         type Text = qwen3_tts::Text;
         type W = <Predictor as Geometry>::Hidden;
         let unsupported = |message: &str| io::Error::new(io::ErrorKind::Unsupported, message);
@@ -608,13 +656,15 @@ impl Decoder for Overriding<CodePredictor> {
         let projected: HbmTensor<bf16, Chip, m![Block, W]> = Function::new(&projection, forward)
             .forward(device, (), &mut (), &inputs)
             .await?;
-        let first = qwen3_tts::Codebook::SIZE;
+        // The call's rows alone, which its token IDs name: a whole block's copy costs as much as
+        // the predictor's layers.
+        let first = qwen3_tts::PROJECTED;
         let width = Rows::<bf16, Symbol<W>>::bytes();
-        let mut placed = (self
-            .table
-            .alias(first * width..(first + Block::SIZE) * width))
-        .map_err(other)?;
+        let live = positions.len();
+        let mut placed =
+            (self.table.alias(first * width..(first + live) * width)).map_err(other)?;
         let projected = projected.into_buffer();
+        let projected = projected.alias(..live * width).map_err(other)?;
         ops_copy(device, [(&projected, &mut placed)])?;
         let batch = batch.named(device, first).await?;
         let kept = self
@@ -622,8 +672,804 @@ impl Decoder for Overriding<CodePredictor> {
             .model
             .call(device, layers, batch, tiling)
             .await?;
-        greedy!(Predictor, &self.decoder.lm_head[step - 1], device, kept)
+        Ok((step, kept))
     }
+}
+
+/// The code predictor whose calls return each kept row's FP32 scores of the entry its position
+/// names, the padded rows past the codebook's lowest, for a caller that samples them.
+///
+/// - Every entry's row of the talker's table and of the predictor's tables is projected into the
+///   body's token table once, at the first call ([`Scoring::row`]); the rows a call gives are
+///   projected into rows of their own past them ([`Scoring::given`]). A call row's token ID names
+///   its row, so a call launches the body and the head alone.
+pub struct Scoring {
+    predictor: Overriding<CodePredictor>,
+    /// Second owners of the talker's table and of the tables of positions 2 to 15, which the
+    /// projected rows are computed from.
+    sources: Vec<HbmBuffer>,
+    /// Set once the token table holds every source row projected.
+    projected: std::sync::OnceLock<()>,
+}
+
+type Talked = qwen3_tts::Talked;
+
+/// `tensor`, and a second owner of its storage.
+fn second_owner<E: M>(tensor: HbmTensor<bf16, Chip, E>) -> (HbmTensor<bf16, Chip, E>, HbmBuffer) {
+    let buffer = tensor.into_buffer();
+    let second = (buffer.alias(..)).unwrap_or_else(|_| unreachable!("a buffer aliases itself"));
+    let tensor = alias(&buffer, ..).unwrap_or_else(|_| unreachable!("a buffer is its own tensor"));
+    (tensor, second)
+}
+
+type PredictorHidden = <Predictor as Geometry>::Hidden;
+type PredictorVocabulary = <Predictor as Geometry>::Vocabulary;
+
+impl Decoder for Scoring {
+    const OUTPUT: Output = Output::Scores;
+    type Output = Rows<f32, m![PredictorVocabulary]>;
+    type Layers = <Overriding<CodePredictor> as Decoder>::Layers;
+    type Adapter = <Overriding<CodePredictor> as Decoder>::Adapter;
+
+    fn limits(&self) -> Limits {
+        Decoder::limits(&self.predictor)
+    }
+
+    fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
+        views(storage)
+    }
+
+    async fn call(
+        &self,
+        device: &mut Device,
+        layers: &mut Self::Layers,
+        batch: Batch<'_, Self::Adapter>,
+        tiling: Tiling,
+    ) -> io::Result<Rows<f32, m![PredictorVocabulary]>> {
+        let (step, kept) = self.predict(device, layers, batch, tiling).await?;
+        let head = &self.predictor.decoder.lm_head[step - 1].head;
+        scored!(PredictorHidden, PredictorVocabulary, head, device, kept)
+    }
+}
+
+impl Scoring {
+    /// The predictor of `sources`' tables, which its first call projects into its token table.
+    fn new(predictor: Overriding<CodePredictor>, sources: Vec<HbmBuffer>) -> Self {
+        Self {
+            predictor,
+            sources,
+            projected: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The first row of the token table that holds the projected entries a row at `position`
+    /// reads, and their count.
+    fn span(position: usize) -> (usize, usize) {
+        match position {
+            1 => (0, Talked::SIZE),
+            _ => (
+                Talked::SIZE + (position - 2) * qwen3_tts::Codebook::SIZE,
+                qwen3_tts::Codebook::SIZE,
+            ),
+        }
+    }
+
+    /// The token-table row of `entry`, of the table a row at `position` reads: the token ID of
+    /// that row.
+    pub fn row(position: usize, entry: usize) -> usize {
+        Self::span(position).0 + entry
+    }
+
+    /// The token-table row that a call's own row `call` is placed at: the token ID of that row.
+    pub const fn given(call: usize) -> usize {
+        qwen3_tts::PROJECTED + call
+    }
+
+    /// Every source row projected into the body's width, into the token table, a block of rows a
+    /// launch, as a call projects its own rows; at the first call.
+    fn projected(&self, device: &mut Device) -> io::Result<()> {
+        if self.projected.get().is_some() {
+            return Ok(());
+        }
+        type Text = qwen3_tts::Text;
+        type W = <Predictor as Geometry>::Hidden;
+        let text = Rows::<bf16, Symbol<Text>>::bytes();
+        let width = Rows::<bf16, Symbol<W>>::bytes();
+        let projection = &self.predictor.decoder.small_to_mtp_projection;
+        let projection = Affine::new(&projection.weight, &projection.bias);
+        let function = Function::new(&projection, forward);
+        for (position, source) in (1..=qwen3_tts::GROUPS).zip(&self.sources) {
+            let (start, rows) = Self::span(position);
+            for block in (0..rows).step_by(Block::SIZE) {
+                let input: HbmTensor<bf16, Chip, m![Block, Text]> =
+                    alias(source, block * text..(block + Block::SIZE) * text)?;
+                let at = start + block;
+                let mut output: HbmTensor<bf16, Chip, m![Block, W]> = alias(
+                    &self.predictor.table,
+                    at * width..(at + Block::SIZE) * width,
+                )?;
+                function.forward_into(device, (), &mut (), &input, &mut output)?;
+            }
+        }
+        self.projected.get_or_init(|| ());
+        Ok(())
+    }
+
+    /// The kept rows' hidden values and the position they share, whose entry they pick: each row's
+    /// token names its row of the token table, the rows the call gives projected into theirs.
+    async fn predict(
+        &self,
+        device: &mut Device,
+        layers: &mut <Self as Decoder>::Layers,
+        batch: Batch<'_, <Self as Decoder>::Adapter>,
+        tiling: Tiling,
+    ) -> io::Result<(usize, Rows<bf16, Symbol<PredictorHidden>>)> {
+        type Text = qwen3_tts::Text;
+        type W = PredictorHidden;
+        let unsupported = |message: &str| io::Error::new(io::ErrorKind::Unsupported, message);
+        let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message);
+        let other = io::Error::other;
+        let positions = batch.positions();
+        let mut steps = batch.kept().iter().map(|&row| positions[row]);
+        let step = steps.next().unwrap_or(1);
+        if steps.any(|other| other != step) {
+            return Err(unsupported(
+                "the kept rows of a predictor call share one position",
+            ));
+        }
+        if !(1..=qwen3_tts::GROUPS).contains(&step) {
+            return Err(invalid(
+                "a kept row picks an entry of a later codebook, at 1 to 15",
+            ));
+        }
+        if positions
+            .iter()
+            .any(|&position| position > qwen3_tts::GROUPS)
+        {
+            return Err(invalid("a frame's sequence holds 16 rows"));
+        }
+        self.projected(device)?;
+        let (text, width) = (
+            Rows::<bf16, Symbol<Text>>::bytes(),
+            Rows::<bf16, Symbol<W>>::bytes(),
+        );
+        let live = positions.len();
+        let mut given = vec![false; live];
+        // The rows the call gives, the talker's hidden rows, projected into their own rows.
+        let overrides: Vec<_> = batch.overrides().collect();
+        if !overrides.is_empty() {
+            let inputs = HbmBuffer::alloc(device, Block::SIZE * text).map_err(other)?;
+            let mut rows = Vec::new();
+            for (calls, values) in overrides {
+                for (at, call) in calls.enumerate() {
+                    given[call] = true;
+                    let value = (values.alias(at * text..(at + 1) * text)).map_err(other)?;
+                    let input = (inputs.alias(call * text..(call + 1) * text)).map_err(other)?;
+                    rows.push((value, input));
+                }
+            }
+            ops_copy(device, rows.iter_mut().map(|(from, to)| (&*from, to)))?;
+            let inputs: HbmTensor<bf16, Chip, m![Block, Text]> = alias(&inputs, ..)?;
+            let projection = &self.predictor.decoder.small_to_mtp_projection;
+            let projection = Affine::new(&projection.weight, &projection.bias);
+            let projected: HbmTensor<bf16, Chip, m![Block, W]> =
+                Function::new(&projection, forward)
+                    .forward(device, (), &mut (), &inputs)
+                    .await?;
+            let projected = projected.into_buffer();
+            let mut pairs = (0..live)
+                .filter(|&call| given[call])
+                .map(|call| {
+                    let row = Self::given(call);
+                    Ok((
+                        (projected.alias(call * width..(call + 1) * width)).map_err(other)?,
+                        (self.predictor.table.alias(row * width..(row + 1) * width))
+                            .map_err(other)?,
+                    ))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            ops_copy(device, pairs.iter_mut().map(|(from, to)| (&*from, to)))?;
+        }
+        if (positions.iter().zip(&given)).any(|(&position, &given)| position == 0 && !given) {
+            return Err(invalid(
+                "a frame's first row is the talker's hidden row, an override",
+            ));
+        }
+        let kept = (self.predictor.decoder.model)
+            .call(device, layers, batch, tiling)
+            .await?;
+        Ok((step, kept))
+    }
+}
+
+/// The token table of a base model's body `$body` with a second owner of its storage: the body
+/// placed back, and the storage.
+macro_rules! shared {
+    ($body:expr) => {{
+        let Then(
+            Then(
+                Backbone {
+                    embedding: Named(table),
+                    body,
+                },
+                norm,
+            ),
+            store,
+        ) = $body;
+        let (table, storage) =
+            (table.shared()).unwrap_or_else(|_| unreachable!("a buffer aliases itself"));
+        (
+            Then(
+                Then(
+                    Backbone {
+                        embedding: Named(table),
+                        body,
+                    },
+                    norm,
+                ),
+                store,
+            ),
+            storage,
+        )
+    }};
+}
+
+/// Qwen3-TTS 1.7B's BF16 talker on one chip.
+type TalkerModel = qwen3_tts::ForConditionalGeneration<
+    qwen3_tts::Talker<"1.7B">,
+    form::Affine,
+    Parallel<1>,
+    cache::Bf16,
+    Hbm,
+>;
+
+type Talker = qwen3_tts::Talker<"1.7B">;
+
+/// Qwen3-TTS 1.7B's talker and code predictor on one chip, served a frame of entries a talker row.
+pub type Speaker = qwen3_tts::Speaker<TalkerModel, CodePredictor>;
+
+/// The speaker reads a whole checkpoint; each of its models serves with a second owner of its
+/// body's token table.
+impl crate::registry::Listed for Speaker {
+    fn reads(part: Part) -> Result<(), LoadError> {
+        match part {
+            Part::Whole => Ok(()),
+            Part::Encoder => Err(LoadError::Unsupported {
+                name: "encoder".into(),
+                reason: "a decoder holds no media encoder that loads alone".into(),
+            }),
+        }
+    }
+
+    fn served(mut self, tiling: Tiling) -> crate::registry::Model {
+        let (body, table) = shared!(self.talker.model.body);
+        self.talker.model.body = body;
+        let talker = Overriding {
+            decoder: self.talker,
+            table,
+        };
+        let (body, table) = shared!(self.predictor.model.body);
+        self.predictor.model.body = body;
+        // The tables of positions 1 to 15, whose rows the predictor projects once.
+        let (talker_table, talked) = second_owner(self.predictor.talker_table);
+        self.predictor.talker_table = talker_table;
+        let (tables, mut sources): (Vec<_>, Vec<_>) =
+            self.predictor.tables.map(second_owner).into_iter().unzip();
+        self.predictor.tables = (tables.try_into())
+            .unwrap_or_else(|_| unreachable!("as many tables as the predictor's"));
+        sources.insert(0, talked);
+        sources.truncate(qwen3_tts::GROUPS);
+        let predictor = Scoring::new(
+            Overriding {
+                decoder: self.predictor,
+                table,
+            },
+            sources,
+        );
+        let speaking = Speaking {
+            talker,
+            predictor: Instance::new(predictor, tiling),
+            embeddings: self.embeddings,
+            last: std::sync::Mutex::new(None),
+        };
+        crate::registry::Model::Decoder(Box::new(Instance::new(speaking, tiling)))
+    }
+}
+
+/// The speaker's rows' axes: the talker's width, and its embeddings' tables and projections.
+type Spoken = qwen3_tts::Text;
+type TtsStacked = qwen3_tts::Stacked;
+type TtsTextWidth = qwen3_tts::TextWidth;
+type TtsTextInner = qwen3_tts::TextInner;
+type TtsTextVocabulary = qwen3_tts::TextVocabulary;
+type TtsCodecRows = qwen3_tts::CodecRows;
+
+/// The speaker as a decoder: a call runs the talker over its requests' rows, every row an override,
+/// and returns each kept row's FP32 scores of its frame's first entry, the talker head's, its
+/// suppressed control rows lowest.
+///
+/// - `frames` then gives the frames of the call's kept rows whose first entries the caller drew:
+///   the code predictor, fed each row's hidden values on a cache of its own, scores each later
+///   entry, which the host draws as a [`Sampling`] says.
+/// - `rows` gives the rows a frame and a text row give the talker next; `text`, `codec` and `add`
+///   a prompt's rows; all on the device.
+pub struct Speaking {
+    talker: Overriding<TalkerModel>,
+    predictor: Instance<Scoring>,
+    embeddings: qwen3_tts::Embeddings,
+    /// The last call's kept hidden rows, which `frames` feeds the predictor.
+    last: std::sync::Mutex<Option<Rows<bf16, Symbol<TalkerHidden>>>>,
+}
+
+type TalkerHidden = <Talker as Geometry>::Hidden;
+type TalkerVocabulary = <Talker as Geometry>::Vocabulary;
+
+/// A frame's picks: sixteen rows of the stacked tables a row of a block.
+type Picks = axis::Rows<2048>;
+
+/// Each kept row's scores of the talker's rows, FP32.
+impl Decoder for Speaking {
+    const OUTPUT: Output = Output::Scores;
+    type Output = Rows<f32, m![TalkerVocabulary]>;
+    type Layers = <Talker as Geometry>::Layers<Blocks<KvHeads, Head>>;
+    /// The talker's base model's, of which the speaker's calls run none.
+    type Adapter = <Base<Talker> as Decoder>::Adapter;
+
+    fn limits(&self) -> Limits {
+        Decoder::limits(&self.talker)
+    }
+
+    fn layers(storage: &[HbmBuffer]) -> io::Result<Self::Layers> {
+        views(storage)
+    }
+
+    async fn call(
+        &self,
+        device: &mut Device,
+        layers: &mut Self::Layers,
+        batch: Batch<'_, Self::Adapter>,
+        tiling: Tiling,
+    ) -> io::Result<Rows<f32, m![TalkerVocabulary]>> {
+        let first = TalkerVocabulary::SIZE - <Talker as Decode>::Rows::SIZE;
+        let row = Rows::<bf16, Symbol<TalkerHidden>>::bytes();
+        let batch = batch
+            .place(device, &self.talker.table, (first, row))
+            .await?;
+        let hidden = self
+            .talker
+            .decoder
+            .model
+            .call(device, layers, batch, tiling)
+            .await?;
+        // The head's scores with its bias, which lowers the control rows.
+        let head = &self.talker.decoder.codec_head.head;
+        let scores: io::Result<Rows<f32, m![TalkerVocabulary]>> =
+            async { scored!(TalkerHidden, TalkerVocabulary, head, device, hidden) }.await;
+        *self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hidden);
+        scores
+    }
+}
+
+impl Speaking {
+    /// The frames of the last call's kept rows whose first entries are `firsts`, in kept order:
+    /// each row's sixteen entries, the other fifteen picked as `sampling` says from the code
+    /// predictor's FP32 scores, the predictor fed the row's hidden values and the entries before,
+    /// each row's draws from its seed of `seeds`. A call's frames are given once.
+    pub async fn frames(
+        &self,
+        device: &mut Device,
+        firsts: &[i32],
+        sampling: Sampling,
+        seeds: &[u64],
+    ) -> io::Result<Vec<[i32; Sixteen::SIZE]>> {
+        let other = io::Error::other;
+        let invalid =
+            |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_string());
+        let hidden = (self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .take()
+        .ok_or_else(|| invalid("frames follow a call of the talker"))?;
+        let count = hidden.len();
+        if firsts.len() != count || seeds.len() != count {
+            return Err(invalid("a first entry and a seed a kept row of the call"));
+        }
+        let mut frames: Vec<[i32; Sixteen::SIZE]> = (firsts.iter())
+            .map(|&first| std::array::from_fn(|group| if group == 0 { first } else { 0 }))
+            .collect();
+        if count == 0 {
+            return Ok(frames);
+        }
+        let mut draws: Vec<Draws> = seeds.iter().map(|&seed| Draws(seed)).collect();
+        let row = Rows::<bf16, Symbol<TalkerHidden>>::bytes();
+        let predictor = &self.predictor;
+        let limits = Decoder::limits(predictor.decoder());
+        // A call's token IDs one after another, then token 0 to the call's compiled rows, which the
+        // call reads in place.
+        let upload = async |device: &mut Device, words: &[i32]| -> io::Result<HbmBuffer> {
+            let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            bytes.resize(bytes.len().max(limits.rows * size_of::<i32>()), 0);
+            HostBufferSlice::from(&bytes[..])
+                .to_hbm(&mut device.pdma)
+                .await
+                .map_err(other)
+        };
+        let cache = Cache::new(device, &limits.cache, count)?;
+        let entries = PredictorVocabulary::SIZE;
+        let mut host = vec![0u8; count * entries * 4];
+        for position in 1..=qwen3_tts::GROUPS {
+            // A row's first call reads its hidden row, then its first entry; each later one reads
+            // its entry before: each by its token-table row.
+            let named = |position: usize, entry: i32| -> io::Result<i32> {
+                let entry = usize::try_from(entry)
+                    .ok()
+                    .filter(|&entry| entry < Scoring::span(position).1)
+                    .ok_or_else(|| invalid("an entry lies outside its table"))?;
+                Ok(Scoring::row(position, entry) as i32)
+            };
+            let words: Vec<i32> = match position {
+                1 => (firsts.iter().enumerate())
+                    .map(|(at, &first)| Ok([Scoring::given(2 * at) as i32, named(1, first)?]))
+                    .collect::<io::Result<Vec<_>>>()?
+                    .concat(),
+                _ => (frames.iter())
+                    .map(|frame| named(position, frame[position - 1]))
+                    .collect::<io::Result<_>>()?,
+            };
+            let tokens = upload(device, &words).await?;
+            let requests = (0..count)
+                .map(|at| {
+                    let (cached, tokens, overrides) = match position {
+                        1 => (
+                            0,
+                            Rows::new(&tokens, 2 * at..2 * at + 2)?,
+                            vec![(
+                                0,
+                                hidden
+                                    .buffer()
+                                    .alias(at * row..(at + 1) * row)
+                                    .map_err(other)?,
+                            )],
+                        ),
+                        _ => (position, Rows::new(&tokens, at..at + 1)?, Vec::new()),
+                    };
+                    Ok(Request {
+                        rows: vec![vec![at as u32]],
+                        cached,
+                        tokens,
+                        keep: Keep::Last,
+                        adapter: None,
+                        positions: None,
+                        mask: None,
+                        overrides,
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let scores: Rows<f32, m![PredictorVocabulary]> =
+                AsyncModule::forward(predictor, device, (), &cache, &requests[..]).await?;
+            (scores
+                .buffer()
+                .to_host(&mut device.pdma)
+                .output(&mut host[..])
+                .await)
+                .map_err(other)?;
+            for (at, frame) in frames.iter_mut().enumerate() {
+                let scores: Vec<f32> = (host[at * entries * 4..(at + 1) * entries * 4]
+                    .as_chunks::<4>()
+                    .0
+                    .iter())
+                .take(qwen3_tts::Codebook::SIZE)
+                .map(|&bytes| f32::from_le_bytes(bytes))
+                .collect();
+                frame[position] = sampling.pick(&scores, draws[at].uniform()) as i32;
+            }
+        }
+        Ok(frames)
+    }
+
+    /// The rows the talker reads after `frames`: each frame's sixteen table rows summed in FP32 and
+    /// rounded once, then its text row of `texts` added, as Transformers sums them.
+    pub async fn rows(
+        &self,
+        device: &mut Device,
+        frames: &[[i32; Sixteen::SIZE]],
+        texts: &[HbmBuffer],
+    ) -> io::Result<Rows<bf16, m![Spoken]>> {
+        let other = io::Error::other;
+        let invalid =
+            |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_string());
+        let count = frames.len();
+        if count > Block::SIZE || texts.len() != count {
+            return Err(invalid(
+                "rows of at most a block of frames, a text row each",
+            ));
+        }
+        let row = Rows::<bf16, m![Spoken]>::bytes();
+        let mut offsets = vec![0i32; Picks::SIZE];
+        for (at, frame) in frames.iter().enumerate() {
+            for (group, &code) in frame.iter().enumerate() {
+                let limit = if group == 0 { 3072 } else { 2048 };
+                let code = usize::try_from(code)
+                    .ok()
+                    .filter(|&code| code < limit)
+                    .ok_or_else(|| invalid("an entry lies outside its codebook"))?;
+                offsets[at * Sixteen::SIZE + group] =
+                    ((qwen3_tts::codec_row(group) + code) * row) as i32;
+            }
+        }
+        let bytes: Vec<u8> = offsets
+            .iter()
+            .flat_map(|offset| offset.to_le_bytes())
+            .collect();
+        let offsets: HbmTensor<i32, Chip, m![Picks]> = alias(
+            &HostBufferSlice::from(&bytes[..])
+                .to_hbm(&mut device.pdma)
+                .await
+                .map_err(other)?,
+            ..,
+        )?;
+        let picked: HbmTensor<bf16, Chip, m![Picks, Spoken]> = Function::new(&Gather, forward)
+            .forward(device, (), &mut (), (&self.embeddings.codecs, &offsets))
+            .await?;
+        let stacked: HbmTensor<bf16, Chip, m![Block, TtsStacked]> =
+            alias(&picked.into_buffer(), ..)?;
+        let summed: HbmTensor<bf16, Chip, m![Block, Spoken]> =
+            Function::new(&self.embeddings.sum, forward)
+                .forward(device, (), &mut (), &stacked)
+                .await?;
+        let text = HbmBuffer::alloc(device, Block::SIZE * row).map_err(other)?;
+        let mut pairs = (texts.iter().enumerate())
+            .map(|(at, source)| Ok((source, text.alias(at * row..(at + 1) * row).map_err(other)?)))
+            .collect::<io::Result<Vec<_>>>()?;
+        ops_copy(device, pairs.iter_mut().map(|(from, to)| (*from, to)))?;
+        let text: HbmTensor<bf16, Chip, m![Block, Spoken]> = alias(&text, ..)?;
+        let rows = Function::new(&furiosa_opt_models::ops::pointwise::add::Add, forward)
+            .forward(device, (), &mut (), (&summed, &text))
+            .await?;
+        Rows::new(&rows.into_buffer(), 0..count)
+    }
+
+    /// The rows of `pairs`, each the BF16 sum of its two rows, a missing one zero, as Transformers
+    /// adds a prompt's text rows and codec rows: a text row and a codec row, the speaker's
+    /// embedding, or a text row alone.
+    pub async fn add(
+        &self,
+        device: &mut Device,
+        pairs: &[(Option<HbmBuffer>, Option<HbmBuffer>)],
+    ) -> io::Result<Rows<bf16, m![Spoken]>> {
+        let other = io::Error::other;
+        let row = Rows::<bf16, m![Spoken]>::bytes();
+        let output = HbmBuffer::alloc(device, pairs.len().max(1) * row).map_err(other)?;
+        let zeros = vec![0u8; Block::SIZE * row];
+        for (at, block) in pairs.chunks(Block::SIZE).enumerate() {
+            let mut sides = Vec::with_capacity(2);
+            for side in 0..2 {
+                let buffer = (HostBufferSlice::from(&zeros[..])
+                    .to_hbm(&mut device.pdma)
+                    .await)
+                    .map_err(other)?;
+                let mut copies = (block.iter().enumerate())
+                    .filter_map(|(at, pair)| {
+                        let source = if side == 0 {
+                            pair.0.as_ref()
+                        } else {
+                            pair.1.as_ref()
+                        }?;
+                        Some(
+                            buffer
+                                .alias(at * row..(at + 1) * row)
+                                .map(|target| (source, target)),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(other)?;
+                ops_copy(device, copies.iter_mut().map(|(from, to)| (*from, to)))?;
+                sides.push(alias::<bf16, Chip, m![Block, Spoken]>(&buffer, ..)?);
+            }
+            let sum = Function::new(&furiosa_opt_models::ops::pointwise::add::Add, forward)
+                .forward(device, (), &mut (), (&sides[0], &sides[1]))
+                .await?
+                .into_buffer();
+            let start = at * Block::SIZE;
+            let source = sum.alias(..block.len() * row).map_err(other)?;
+            let mut target =
+                (output.alias(start * row..(start + block.len()) * row)).map_err(other)?;
+            ops_copy(device, [(&source, &mut target)])?;
+        }
+        Rows::new(&output, 0..pairs.len())
+    }
+
+    /// The talker's text rows of `ids`: `text_embedding`, then `text_projection`, a block at a time.
+    pub async fn text(
+        &self,
+        device: &mut Device,
+        ids: &[i32],
+    ) -> io::Result<Rows<bf16, m![Spoken]>> {
+        let embeddings = &self.embeddings;
+        let row = Rows::<bf16, m![Spoken]>::bytes();
+        let entry = Rows::<bf16, m![TtsTextWidth]>::bytes();
+        let output = HbmBuffer::alloc(device, ids.len().max(1) * row).map_err(io::Error::other)?;
+        for (at, block) in ids.chunks(Block::SIZE).enumerate() {
+            let gathered = gather_rows::<TtsTextVocabulary, TtsTextWidth>(
+                device,
+                &embeddings.text,
+                block,
+                entry,
+            )
+            .await?;
+            let inner: HbmTensor<bf16, Chip, m![Block, TtsTextInner]> =
+                Function::new(&embeddings.fc1, forward)
+                    .forward(device, (), &mut (), &gathered)
+                    .await?;
+            let inner = Function::new(
+                &furiosa_opt_models::ops::pointwise::activation::Silu,
+                forward,
+            )
+            .forward(device, (), &mut (), &inner)
+            .await?;
+            let projected: HbmTensor<bf16, Chip, m![Block, Spoken]> =
+                Function::new(&embeddings.fc2, forward)
+                    .forward(device, (), &mut (), &inner)
+                    .await?;
+            let projected = projected.into_buffer();
+            let source = projected
+                .alias(..block.len() * row)
+                .map_err(io::Error::other)?;
+            let start = at * Block::SIZE;
+            let mut target = (output.alias(start * row..(start + block.len()) * row))
+                .map_err(io::Error::other)?;
+            ops_copy(device, [(&source, &mut target)])?;
+        }
+        Rows::new(&output, 0..ids.len())
+    }
+
+    /// The talker's codec table rows of `ids`, which a prompt's control rows read.
+    pub async fn codec(
+        &self,
+        device: &mut Device,
+        ids: &[i32],
+    ) -> io::Result<Rows<bf16, m![Spoken]>> {
+        let row = Rows::<bf16, m![Spoken]>::bytes();
+        let output = HbmBuffer::alloc(device, ids.len().max(1) * row).map_err(io::Error::other)?;
+        for (at, block) in ids.chunks(Block::SIZE).enumerate() {
+            if block.iter().any(|&id| !(0..3072).contains(&id)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a codec row outside the table",
+                ));
+            }
+            let gathered =
+                gather_rows::<TtsCodecRows, Spoken>(device, &self.embeddings.codecs, block, row)
+                    .await?
+                    .into_buffer();
+            let source = gathered
+                .alias(..block.len() * row)
+                .map_err(io::Error::other)?;
+            let start = at * Block::SIZE;
+            let mut target = (output.alias(start * row..(start + block.len()) * row))
+                .map_err(io::Error::other)?;
+            ops_copy(device, [(&source, &mut target)])?;
+        }
+        Rows::new(&output, 0..ids.len())
+    }
+}
+
+/// How a host picks an entry from its FP32 scores: the first highest at temperature 0, else a
+/// draw from the softmax of the scores over `temperature`, of the `top_k` highest (all at 0) and
+/// of those the fewest whose mass reaches `top_p`, as Transformers samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sampling {
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+}
+
+impl Sampling {
+    /// The first highest score's.
+    pub const GREEDY: Self = Self {
+        temperature: 0.0,
+        top_k: 0,
+        top_p: 1.0,
+    };
+
+    /// The entry of `scores` this sampling picks with the uniform draw `uniform` in [0, 1).
+    pub fn pick(&self, scores: &[f32], uniform: f64) -> usize {
+        let first = (0..scores.len()).fold(
+            0,
+            |best, at| if scores[at] > scores[best] { at } else { best },
+        );
+        if self.temperature <= 0.0 || scores.len() < 2 {
+            return first;
+        }
+        let temperature = f64::from(self.temperature);
+        // Highest first, ties by index: a total order, so the `top_k` it selects and then sorts
+        // are the first `top_k` of the whole sorted order.
+        let descending = |a: &usize, b: &usize| scores[*b].total_cmp(&scores[*a]).then(a.cmp(b));
+        let mut order: Vec<usize> = (0..scores.len()).collect();
+        if self.top_k > 0 && self.top_k < order.len() {
+            order.select_nth_unstable_by(self.top_k - 1, descending);
+            order.truncate(self.top_k);
+        }
+        order.sort_by(descending);
+        let highest = f64::from(scores[order[0]]) / temperature;
+        let mut weights: Vec<f64> = (order.iter())
+            .map(|&at| (f64::from(scores[at]) / temperature - highest).exp())
+            .collect();
+        if self.top_p < 1.0 {
+            let total: f64 = weights.iter().sum();
+            let (mut mass, mut kept) = (0.0, 0);
+            while kept < weights.len() && (kept == 0 || mass < f64::from(self.top_p)) {
+                mass += weights[kept] / total;
+                kept += 1;
+            }
+            weights.truncate(kept);
+        }
+        let total: f64 = weights.iter().sum();
+        if !(total.is_finite() && total > 0.0) {
+            return first;
+        }
+        let mut target = uniform * total;
+        for (at, weight) in weights.iter().enumerate() {
+            if target < *weight {
+                return order[at];
+            }
+            target -= weight;
+        }
+        order[weights.len() - 1]
+    }
+}
+
+/// A row's uniform draws, SplitMix64 from its seed.
+struct Draws(u64);
+
+impl Draws {
+    /// The next draw in [0, 1).
+    fn uniform(&mut self) -> f64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut mixed = self.0;
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        mixed ^= mixed >> 31;
+        (mixed >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// The rows `ids` of `table`, `bytes` a row, in a block of rows; the block's rows past them read
+/// the table's first.
+async fn gather_rows<R: AxisName + Send + Sync, W: AxisName + Send + Sync>(
+    device: &mut Device,
+    table: &HbmTensor<bf16, Chip, m![R, W]>,
+    ids: &[i32],
+    bytes: usize,
+) -> io::Result<HbmTensor<bf16, Chip, m![Block, W]>> {
+    let mut offsets = vec![0i32; Block::SIZE];
+    for (at, &id) in ids.iter().enumerate() {
+        let id = usize::try_from(id)
+            .ok()
+            .filter(|&id| id < R::SIZE)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "an ID outside the table")
+            })?;
+        offsets[at] = i32::try_from(id * bytes).map_err(io::Error::other)?;
+    }
+    let bytes: Vec<u8> = offsets
+        .iter()
+        .flat_map(|offset| offset.to_le_bytes())
+        .collect();
+    let offsets: HbmTensor<i32, Chip, m![Block]> = alias(
+        &HostBufferSlice::from(&bytes[..])
+            .to_hbm(&mut device.pdma)
+            .await
+            .map_err(io::Error::other)?,
+        ..,
+    )?;
+    Function::new(&Gather, forward)
+        .forward(device, (), &mut (), (table, &offsets))
+        .await
 }
 
 /// The BF16 base model of the size `S` on one chip, whose calls a classifier of `S` makes.

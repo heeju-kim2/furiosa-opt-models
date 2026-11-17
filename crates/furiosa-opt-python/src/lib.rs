@@ -46,6 +46,7 @@ fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<model::LoadOptions>()?;
     module.add_class::<model::Decoder>()?;
     module.add_class::<model::Encoder>()?;
+    module.add_class::<model::Vocoder>()?;
     module.add_class::<tensor::Placement>()?;
     // Memory
     module.add_class::<tensor::Device>()?;

@@ -282,6 +282,11 @@ impl Config {
         self.part
     }
 
+    /// What the implementation serves as.
+    pub fn role(&self) -> crate::registry::Role {
+        self.implementation.role()
+    }
+
     /// The form of the implementation's projection weights.
     pub fn precision(&self) -> Dtype {
         self.precision

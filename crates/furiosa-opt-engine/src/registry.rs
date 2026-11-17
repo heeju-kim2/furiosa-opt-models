@@ -1,8 +1,9 @@
-//! The registry: every upstream architecture name once, by family level, with the decoders and
-//! media encoders that implement it, or none when the name is refused.
+//! The registry: every upstream architecture name once, by family level, with the decoders, media
+//! encoders and speech decoders that implement it, or none when the name is refused.
 //!
 //! - `ARCHITECTURES` lists each name, and each alias as a name of its own, with its
-//!   implementations: a decoder or media encoder type at one size each.
+//!   implementations: a decoder, media encoder or speech decoder type at one size each, whose
+//!   [`Role`] a framework knows before a load reads a weight.
 //! - `Implementation::listed` finds the first of some architecture names that the list holds, with
 //!   its implementations, and `choose` picks the one whose scope serves a checkpoint, from its
 //!   config and names alone; its `load` then reads the checkpoint strictly at that scope into HBM,
@@ -12,6 +13,7 @@
 //! - A refused name is `Unsupported`, an unknown one `InvalidData`.
 
 use crate::decoder::{Decoder, Instance, Served};
+use crate::speech::Vocoder;
 use crate::vision_language::Encoder;
 use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError, Part};
 use furiosa_opt_models::models::decoder::attention::{llama, qwen3, qwen3_tts};
@@ -429,7 +431,27 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
             >,
         >()],
     ),
-    ("Qwen3TTSTalkerForConditionalGeneration", &[]),
+    (
+        "Qwen3TTSTalkerForConditionalGeneration",
+        &[Implementation::of::<
+            qwen3_tts::Speaker<
+                qwen3_tts::ForConditionalGeneration<
+                    qwen3_tts::Talker<"1.7B">,
+                    form::Affine,
+                    Parallel<1>,
+                    cache::Bf16,
+                    Hbm,
+                >,
+                qwen3_tts::CodePredictor<
+                    qwen3_tts::Predictor<"1.7B">,
+                    form::Affine,
+                    Parallel<1>,
+                    cache::Bf16,
+                    Hbm,
+                >,
+            >,
+        >()],
+    ),
     ("Qwen3_5ForCausalLM", &[]),
     ("Qwen3_5ForCausalLMMTP", &[]),
     ("Qwen3_5MTP", &[]),
@@ -867,7 +889,12 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
     // Source: <https://github.com/vllm-project/vllm-omni/blob/6daf5b30f07cc0b3db87766d22fdf433f8a1a7c9/vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_code2wav.py>.
     ("Qwen3OmniMoeCode2Wav", &[]),
     ("Qwen3OmniPipeline", &[]),
-    ("Qwen3TTSCode2Wav", &[]),
+    // Source: vLLM-Omni's `Qwen3TTSCode2Wav`, the 12 Hz speech tokenizer's decoder of a Qwen3-TTS
+    // checkpoint.
+    (
+        "Qwen3TTSCode2Wav",
+        &[Implementation::of::<qwen3_tts::codec::Code2Wav>()],
+    ),
     ("QwenImage21Transformer2DModel", &[]),
     ("QwenImageDMD2Pipeline", &[]),
     ("QwenImageEditPipeline", &[]),
@@ -918,6 +945,7 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
 pub struct Implementation {
     size: &'static str,
     class: Class,
+    role: Role,
     scope: fn(&Checkpoint) -> Result<&'static str, LoadError>,
     adapters: usize,
     load: fn(&mut Context<'_>, &Checkpoint, Tiling) -> Result<Model, LoadError>,
@@ -929,6 +957,16 @@ pub enum Model {
     Decoder(Box<dyn Served>),
     /// A media encoder of images, video frames and audio.
     Encoder(Box<dyn Encoder>),
+    /// A speech decoder of codec frames into waveform samples.
+    Vocoder(Box<dyn Vocoder>),
+}
+
+/// What a listed model serves a framework as, known before a load reads a weight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Decoder,
+    Encoder,
+    Vocoder,
 }
 
 impl Model {
@@ -936,7 +974,15 @@ impl Model {
     pub fn decoder(self) -> Option<Box<dyn Served>> {
         match self {
             Self::Decoder(decoder) => Some(decoder),
-            Self::Encoder(_) => None,
+            Self::Encoder(_) | Self::Vocoder(_) => None,
+        }
+    }
+
+    /// The speech decoder the model is, if it is one.
+    pub fn vocoder(self) -> Option<Box<dyn Vocoder>> {
+        match self {
+            Self::Vocoder(vocoder) => Some(vocoder),
+            Self::Decoder(_) | Self::Encoder(_) => None,
         }
     }
 }
@@ -945,6 +991,9 @@ impl Model {
 pub trait Listed: Implements + for<'a> Load<&'a Checkpoint> + Sized + 'static {
     /// Adapters a call of the model runs at most: none for a model whose projections take none.
     const ADAPTERS: usize = 0;
+
+    /// What the model serves as: a decoder unless the type says otherwise.
+    const ROLE: Role = Role::Decoder;
 
     /// Refuses a load of `part`, which the type does not read.
     fn reads(part: Part) -> Result<(), LoadError>;
@@ -978,6 +1027,7 @@ impl Implementation {
         Self {
             size: T::SIZE,
             class: T::CLASS,
+            role: T::ROLE,
             scope: |source| {
                 T::reads(source.part())?;
                 T::scope(source)
@@ -1058,6 +1108,11 @@ impl Implementation {
     /// The class of the type.
     pub fn class(&self) -> Class {
         self.class
+    }
+
+    /// What the type serves as.
+    pub fn role(&self) -> Role {
+        self.role
     }
 
     /// Adapters a call of the decoder runs at most: none when its projections take none.

@@ -40,6 +40,9 @@ use crate::tensor::form::Weight;
 use crate::tensor::memory::Memory;
 use crate::tensor::parallel::Chip;
 
+pub mod codec;
+pub mod speaker;
+
 /// HF `Qwen3TTSTalkerForConditionalGeneration` of the talker size `S`, read under `talker`: the
 /// body, then the greedy codec head.
 pub type ForConditionalGeneration<S, P, Q, C, X> =
@@ -130,6 +133,7 @@ impl<const N: &'static str> Front for Talker<N> {
         NormalizedQkv<Projection, Named<"q_norm", Norm>, Named<"k_norm", Norm>>;
     type HeadNorm<Norm> = Norm;
     type Table<Table> = Named<"codec_embedding", Table>;
+    type Tokens<Vocabulary: AxisName> = Vocabulary;
 }
 
 // The talker's table as compiled: its 3072 rows, then the rows a call's override rows fill.
@@ -408,24 +412,137 @@ where
     }
 }
 
+/// The talker and its code predictor together, as vLLM-Omni's `Qwen3TTSTalkerForConditionalGeneration`
+/// runs them a frame at a time: a talker row's scores of its frame's first entry, the frame's other
+/// entries by the predictor fed that row, and the rows a prompt and a frame give the talker.
+pub struct Speaker<Talker, Predictor> {
+    pub talker: Talker,
+    pub predictor: Predictor,
+    pub embeddings: Embeddings,
+}
+
+axes![
+    TextVocabulary = 151936,
+    TextWidth = 2048,
+    TextInner = 2048,
+    CodecRows = 33792,
+    Stacked = 32768
+];
+
+/// The rows a talker reads: `model.text_embedding` and `text_projection`, a SiLU pair into the
+/// talker's width; the talker's codec table and each later codebook's, stacked; and the projection
+/// that sums a frame's sixteen rows of them in FP32, rounding once.
+#[derive(DeviceSend)]
+pub struct Embeddings {
+    pub text: HbmTensor<bf16, Chip, m![TextVocabulary, TextWidth]>,
+    pub fc1: Affine<
+        HbmTensor<bf16, Chip, m![TextInner, TextWidth]>,
+        HbmTensor<f32, Chip, m![TextInner]>,
+    >,
+    pub fc2: Affine<HbmTensor<bf16, Chip, m![Text, TextInner]>, HbmTensor<f32, Chip, m![Text]>>,
+    /// The talker's 3072 rows, then each later codebook's 2048.
+    pub codecs: HbmTensor<bf16, Chip, m![CodecRows, Text]>,
+    /// Ones where an output feature is its input row's feature, zero elsewhere.
+    pub sum: crate::ops::linear::Linear<Stacked, Text, Chip>,
+}
+
+impl<'a> Load<&'a Checkpoint> for Embeddings {
+    fn load(cx: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        let width = Text::SIZE;
+        let rows = |cx: &mut Context<'_>, path: &str, count: usize| {
+            let read = cx.field("", path, |cx| cx.floats(from, &[count, width]))?;
+            Ok::<_, LoadError>(read.into_iter().map(bf16::from_f32).collect::<Vec<_>>())
+        };
+        let text = cx.field("text", "model.text_embedding.weight", |cx| {
+            HbmTensor::load(cx, from)
+        })?;
+        let fc1 = cx.field("fc1", "text_projection.linear_fc1", |cx| {
+            Affine::load(cx, from)
+        })?;
+        let fc2 = cx.field("fc2", "text_projection.linear_fc2", |cx| {
+            Affine::load(cx, from)
+        })?;
+        let mut codecs = rows(cx, "model.codec_embedding.weight", ROWS)?;
+        for group in 0..GROUPS {
+            let path = format!("code_predictor.model.codec_embedding.{group}.weight");
+            codecs.extend(rows(cx, &path, CODEBOOK)?);
+        }
+        let codecs = HbmTensor::load(
+            cx,
+            HostTensor::<bf16, m![CodecRows, Text]>::from_vec(codecs),
+        )?;
+        let ones: Vec<bf16> = (0..Text::SIZE * Stacked::SIZE)
+            .map(|at| bf16::from_f32(f32::from(at / Stacked::SIZE == at % Stacked::SIZE % width)))
+            .collect();
+        let sum = crate::ops::linear::Linear::new(Weight::new(HbmTensor::load(
+            cx,
+            HostTensor::<bf16, m![Text, Stacked]>::from_vec(ones),
+        )?));
+        Ok(Self {
+            text,
+            fc1,
+            fc2,
+            codecs,
+            sum,
+        })
+    }
+}
+
+/// The talker, the predictor and the rows they read at the current name, in one strict traversal:
+/// what one ignores another reads.
+impl<'a, T: Load<&'a Checkpoint>, P: Load<&'a Checkpoint>> Load<&'a Checkpoint> for Speaker<T, P> {
+    fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        context.checkpoint(from, |cx| {
+            let talker = T::load(cx, from)?;
+            let predictor = P::load(cx, from)?;
+            let embeddings = Embeddings::load(cx, from)?;
+            Ok(Self {
+                talker,
+                predictor,
+                embeddings,
+            })
+        })
+    }
+}
+
+/// The speaker reads a checkpoint where its talker does.
+impl<T: Implements, P> Implements for Speaker<T, P> {
+    const SIZE: &'static str = T::SIZE;
+    const CLASS: Class = Class {
+        family: "qwen3_tts",
+        name: "Speaker",
+    };
+
+    fn scope(source: &Checkpoint) -> Result<&'static str, LoadError> {
+        T::scope(source)
+    }
+}
+
 /// The codebooks a predictor picks, one a head: each frame's but its first.
 pub const GROUPS: usize = 15;
 
 /// A published Qwen3-TTS code predictor size, by its talker's hub spelling.
 pub struct Predictor<const N: &'static str>;
 
-/// The predictor of every size: Qwen3's front, its token table the rows a call writes.
+/// The predictor of every size: Qwen3's front, its token table the rows its calls read.
 impl<const N: &'static str> Front for Predictor<N> {
     type Heads<Projection, Norm> =
         NormalizedQkv<Projection, Named<"q_norm", Norm>, Named<"k_norm", Norm>>;
     type HeadNorm<Norm> = Norm;
     type Table<Table> = Named<"rows", Table>;
+    type Tokens<Vocabulary: AxisName> = PredictorRows;
 }
 
-// The predictor's table as compiled: a codebook's entries, then 256 more, whose first 128 a call's
-// projection fills, a block of its rows, and which round the head's passes; a codebook's and the
-// talker's stored rows; the talker's width, the projection's input.
+// The predictor's head as compiled: a codebook's entries, then 256 more, which round its passes;
+// a codebook's and the talker's stored rows; the talker's width, the projection's input.
 axes![Entries = 2304, Codebook = 2048, Talked = 3072, Text = 2048];
+
+/// Rows of the predictor's token table: every entry of the talker's table and of the tables of
+/// positions 2 to 15 projected into the body's width, one table after another, then 256 rows,
+/// whose first 128 a call's own rows fill.
+pub const PROJECTED: usize = Talked::SIZE + (GROUPS - 1) * Codebook::SIZE;
+axes![PredictorRows = 32000];
+const _: () = assert!(PredictorRows::SIZE == PROJECTED + 256);
 
 /// BF16 coefficients over `In` with an FP32 bias of `Out`, in memory `X`.
 type Biased<In, Out, X> = Affine<
@@ -606,6 +723,14 @@ impl<G: Geometry + Family, Model, Head, Projection, Talker, Table, P: Form> Impl
             }
         })?;
         P::REQUIREMENT.admits(source).map(|()| "talker")
+    }
+}
+
+/// The first row of each codebook's table in [`Embeddings::codecs`]: the talker's first.
+pub const fn codec_row(group: usize) -> usize {
+    match group {
+        0 => 0,
+        _ => ROWS + (group - 1) * CODEBOOK,
     }
 }
 

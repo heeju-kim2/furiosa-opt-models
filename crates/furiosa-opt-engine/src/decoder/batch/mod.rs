@@ -27,14 +27,20 @@ const POSITIONS: usize = 1 << 24;
 pub struct Rows<D, Row> {
     /// Exactly the rows' bytes.
     buffer: HbmBuffer,
+    /// The storage they were named in and the row they start at there, from which a call whose
+    /// requests' rows lie one after another reads them in place.
+    origin: (HbmBuffer, usize),
     row: PhantomData<fn() -> (D, Row)>,
 }
 
 impl<D, Row> Clone for Rows<D, Row> {
     fn clone(&self) -> Self {
+        let again = |buffer: &HbmBuffer| {
+            (buffer.alias(..)).unwrap_or_else(|_| unreachable!("a buffer aliases itself"))
+        };
         Self {
-            buffer: (self.buffer.alias(..))
-                .unwrap_or_else(|_| unreachable!("a buffer aliases itself")),
+            buffer: again(&self.buffer),
+            origin: (again(&self.origin.0), self.origin.1),
             row: PhantomData,
         }
     }
@@ -56,12 +62,17 @@ impl<D: Scalar, Row: M> Rows<D, Row> {
         let end = (rows.end.checked_mul(Self::bytes()))
             .filter(|&end| end <= buffer.size())
             .ok_or_else(|| invalid("rows exceed device storage"))?;
+        let other = io::Error::other;
         Ok(Self {
-            buffer: buffer
-                .alias(rows.start * Self::bytes()..end)
-                .map_err(io::Error::other)?,
+            buffer: (buffer.alias(rows.start * Self::bytes()..end)).map_err(other)?,
+            origin: (buffer.alias(..).map_err(other)?, rows.start),
             row: PhantomData,
         })
+    }
+
+    /// The storage the rows were named in, and the row they start at there.
+    pub fn origin(&self) -> (&HbmBuffer, usize) {
+        (&self.origin.0, self.origin.1)
     }
 
     pub fn len(&self) -> usize {

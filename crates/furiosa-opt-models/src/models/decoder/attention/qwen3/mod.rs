@@ -94,6 +94,7 @@ pub type LmHead<S, X> = Greedy<
 
 type Hidden<S> = <S as Geometry>::Hidden;
 type Vocabulary<S> = <S as Geometry>::Vocabulary;
+type Tokens<S> = <S as Front>::Tokens<Vocabulary<S>>;
 type Groups<S> = <S as Geometry>::Groups;
 type Norm<S, W, X> = <S as Geometry>::Norm<W, X>;
 type Chips<Q> = <Q as Parallelism>::Chip;
@@ -105,13 +106,13 @@ type Body<S, P, Q, C, X> = Then<
         Backbone<
             <S as Front>::Table<
                 Embedding<
-                    Vocabulary<S>,
+                    Tokens<S>,
                     Hidden<S>,
                     Chips<Q>,
                     <X as Memory>::Tensor<
                         bf16,
                         Chips<Q>,
-                        m![{ Symbol<Vocabulary<S>> }, { Symbol<Hidden<S>> }],
+                        m![{ Symbol<Tokens<S>> }, { Symbol<Hidden<S>> }],
                     >,
                 >,
             >,
@@ -131,6 +132,9 @@ pub trait Front {
     /// The token table `Table` under the name its checkpoints store it at, `embed_tokens` for the
     /// text families.
     type Table<Table>;
+    /// The rows of the token table of a size whose vocabulary is `Vocabulary`: the vocabulary's,
+    /// or those of a model whose calls read rows it holds past the checkpoint's tokens.
+    type Tokens<Vocabulary: AxisName>: AxisName;
 }
 
 /// The packed query, key and value projection of a size in form `P`, unpacked into heads.
@@ -151,6 +155,7 @@ impl<const N: &'static str> Front for Size<N> {
         NormalizedQkv<Projection, Named<"q_norm", Norm>, Named<"k_norm", Norm>>;
     type HeadNorm<Norm> = Norm;
     type Table<Table> = Named<"embed_tokens", Table>;
+    type Tokens<Vocabulary: AxisName> = Vocabulary;
 }
 
 /// The size's query, key and value front, the rotation, the cache write, the attention over each

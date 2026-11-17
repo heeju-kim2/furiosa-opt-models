@@ -51,12 +51,14 @@ impl<A> Batch<'_, A> {
             reads.iter().map(|(values, words)| (&values[..], *words)),
         );
         let bytes = R::SIZE * Rows::<i32, m![1]>::bytes();
-        // A lone request of the envelope's rows is read in place, sparing a copy launch.
+        // A lone request of the envelope's rows, or requests whose rows lie one after another in
+        // the storage they were named in, each at its call rows, are read in place, sparing a
+        // copy launch.
         let lone = match &self.tokens[..] {
             [(tokens, _)] if tokens.buffer().size() == bytes => {
                 Some(tokens.buffer().alias(..).map_err(io::Error::other)?)
             }
-            _ => None,
+            tokens => in_place(tokens, bytes)?,
         };
         // The copy launch that places several requests' rows runs on one chip.
         if lone.is_none() && Chips::SIZE > 1 {
@@ -107,6 +109,26 @@ impl<A> Batch<'_, A> {
         };
         Ok((staged, views))
     }
+}
+
+/// The envelope's `bytes` of the storage every request's tokens were named in, when each lies at
+/// its call rows there, the first at its start: the rows past the call's are the storage's own.
+fn in_place(
+    tokens: &[(Rows<i32, m![1]>, Range<usize>)],
+    bytes: usize,
+) -> io::Result<Option<HbmBuffer>> {
+    let Some(((first, _), _)) = tokens.split_first() else {
+        return Ok(None);
+    };
+    let (storage, _) = first.origin();
+    let fits = storage.size() >= bytes
+        && tokens.iter().all(|(rows, calls)| {
+            let (origin, start) = rows.origin();
+            origin.addr() == storage.addr() && start == calls.start && rows.len() == calls.len()
+        });
+    fits.then(|| storage.alias(..bytes))
+        .transpose()
+        .map_err(io::Error::other)
 }
 
 /// Bytes every array of a call's staging buffer starts at: a transfer from an array starting

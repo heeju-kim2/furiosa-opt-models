@@ -82,6 +82,12 @@ impl Checkpoint {
         })
     }
 
+    /// The checkpoint of the folder `name` in this one's directory, with its own config: a model's
+    /// component stored beside its weights, as Qwen3-TTS's `speech_tokenizer`.
+    pub fn folder(&self, name: &str) -> io::Result<Self> {
+        Self::new(self.directory.join(name), None)
+    }
+
     /// This checkpoint with every tensor's bytes copied into host memory, where neither the page
     /// cache's eviction nor a later change to its files reaches them.
     pub fn read(&self) -> Self {

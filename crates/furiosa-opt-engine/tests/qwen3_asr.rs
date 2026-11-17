@@ -335,7 +335,7 @@ fn transcribes_the_clip_from_its_mel_frames() {
         .unwrap()
     {
         Model::Encoder(encoder) => encoder,
-        Model::Decoder(_) => panic!("the encoder part loads a media encoder"),
+        Model::Decoder(_) | Model::Vocoder(_) => panic!("the encoder part loads a media encoder"),
     };
     let model = LoadOptions::new()
         .load(&mut device, &checkpoint)
