@@ -72,7 +72,7 @@ struct Measured {
 ///
 /// TODO: replace them by a cost-model rule (row replication bytes, slab loads, routing)
 /// calibrated on their times, and delete the entries it matches within 1%.
-const MEASURED: [Measured; 43] = [
+const MEASURED: [Measured; 45] = [
     // Replicated
     Measured {
         input: 512,
@@ -172,17 +172,6 @@ const MEASURED: [Measured; 43] = [
         rows: 8,
         listed: Some(437),
         derived: Some(615),
-    },
-    Measured {
-        input: 3072,
-        output: 1024,
-        parts: 4,
-        blocks: 16,
-        passes: 1,
-        routing: Replicated,
-        rows: 8,
-        listed: Some(49),
-        derived: Some(160),
     },
     Measured {
         input: 4096,
@@ -449,6 +438,19 @@ const MEASURED: [Measured; 43] = [
         listed: Some(72),
         derived: Some(145),
     },
+    // Qwen3-0.6B's and the Qwen3-TTS code predictor's gate and up projections, as 2048 by 6144
+    // rings; the derived replicated tiling loads its slab at a sixth of the ring's rate.
+    Measured {
+        input: 1024,
+        output: 3072,
+        parts: 4,
+        blocks: 32,
+        passes: 1,
+        routing: Ring,
+        rows: 8,
+        listed: None,
+        derived: None,
+    },
     Measured {
         input: 2048,
         output: 4096,
@@ -459,6 +461,19 @@ const MEASURED: [Measured; 43] = [
         rows: 8,
         listed: Some(88),
         derived: Some(241),
+    },
+    // Qwen3-1.7B's gate and up projections: its one-row decode call took 33.0 ms with the derived
+    // tiling and 7.1 ms with this one (Replicated 8 x 32: 10.3 ms, 16 x 16: 8.6 ms).
+    Measured {
+        input: 2048,
+        output: 6144,
+        parts: 8,
+        blocks: 32,
+        passes: 1,
+        routing: Ring,
+        rows: 8,
+        listed: None,
+        derived: None,
     },
     Measured {
         input: 2560,
@@ -472,6 +487,19 @@ const MEASURED: [Measured; 43] = [
         derived: Some(201),
     },
     // Chunk
+    // Qwen3-0.6B's and the Qwen3-TTS code predictor's down projection, as 2048 by 1024's: the
+    // replicated tiling of 4 parts took 49 us at 8 rows.
+    Measured {
+        input: 3072,
+        output: 1024,
+        parts: 16,
+        blocks: 16,
+        passes: 1,
+        routing: Chunk,
+        rows: 8,
+        listed: None,
+        derived: None,
+    },
     Measured {
         input: 2048,
         output: 1024,
