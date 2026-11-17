@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import TYPE_CHECKING, assert_never
+from typing import TYPE_CHECKING, Any, assert_never
 
 import torch
 from typing_extensions import override
@@ -13,7 +13,6 @@ from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 
 from furiosa_opt_vllm.admission import Draft, Method
@@ -54,7 +53,7 @@ def choose(
         case None:
             return Sampling(sampler())
         case Method.NGRAM:
-            proposer: NgramProposer | SuffixDecodingProposer | Drafter = NgramProposer(config)
+            proposer: Ngram | SuffixDecodingProposer | Drafter = Ngram.of(config)
         case Method.SUFFIX:
             proposer = SuffixDecodingProposer(config)
         case Draft():
@@ -148,12 +147,29 @@ class Sampling:
 
 
 @dataclass(slots=True)
+class Ngram:
+    """vLLM's n-gram proposer, imported only when a model drafts by n-grams: the numba it compiles
+    with refuses the NumPy that Python 3.14 resolves, so every other model loads without it."""
+
+    proposer: Any
+
+    @classmethod
+    def of(cls, config: VllmConfig) -> Ngram:
+        from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
+        return cls(NgramProposer(config))
+
+    def propose(self, *args: Any) -> list[list[int]]:
+        return self.proposer.propose(*args)
+
+
+@dataclass(slots=True)
 class Speculation:
     """Accept a draft prefix with vLLM rejection and propose the next step's drafts."""
 
     rejection: RejectionSampler
     # A draft model proposes once `allocate` gives it a cache.
-    proposer: NgramProposer | SuffixDecodingProposer | Drafter | Drafting
+    proposer: Ngram | SuffixDecodingProposer | Drafter | Drafting
     # The drafts proposed after the last sampled step, until vLLM takes them.
     drafts: DraftTokenIds | None = None
 
@@ -208,7 +224,7 @@ class Speculation:
     def capacity(self, blocks: int) -> int:
         """The target's cache `blocks`, or fewer when a draft model's cache must hold as many."""
         match self.proposer:
-            case NgramProposer() | SuffixDecodingProposer():
+            case Ngram() | SuffixDecodingProposer():
                 return blocks
             case (Drafter() as drafter) | Drafting(drafter=drafter):
                 return min(blocks, drafter.capacity())
@@ -218,7 +234,7 @@ class Speculation:
     def allocate(self, blocks: int, requests: Mapping[str, CachedRequestState]) -> None:
         """Give a draft model a cache of `blocks` blocks, which `requests`' block tables address."""
         match self.proposer:
-            case NgramProposer() | SuffixDecodingProposer():
+            case Ngram() | SuffixDecodingProposer():
                 pass
             case (Drafter() as drafter) | Drafting(drafter=drafter):
                 self.proposer = Drafting(drafter, blocks, requests)
@@ -229,7 +245,7 @@ class Speculation:
         """Forget what a draft model's cache holds of `req_id`."""
         match self.proposer:
             # Suffix decoding ends a request once the batch no longer holds it.
-            case NgramProposer() | SuffixDecodingProposer() | Drafter():
+            case Ngram() | SuffixDecodingProposer() | Drafter():
                 pass
             case Drafting():
                 self.proposer.retire(req_id)
@@ -240,7 +256,7 @@ class Speculation:
         """Draft up to `count` tokens after each request's `sampled` tokens, in batch order, from
         vLLM's batch rows, which hold the sampled tokens."""
         match self.proposer:
-            case NgramProposer():
+            case Ngram():
                 drafts = self.proposer.propose(
                     count, sampled, batch.num_tokens_no_spec, batch.token_ids_cpu
                 )

@@ -15,7 +15,6 @@ from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.watermarker import RandomSampler
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -24,7 +23,7 @@ from furiosa_opt_vllm.additional import Section
 from furiosa_opt_vllm.admission import speculative
 from furiosa_opt_vllm.generation import greedy, report, sample
 from furiosa_opt_vllm.runner import Logits, Runner
-from furiosa_opt_vllm.selection import Sampling, Speculation, accepted, choose
+from furiosa_opt_vllm.selection import Ngram, Sampling, Speculation, accepted, choose
 
 
 @pytest.mark.parametrize(
@@ -105,7 +104,7 @@ def speculation(served: Path) -> Speculation:
         max_model_len=16,
         speculative_config={"method": "ngram", "num_speculative_tokens": 2},
     ).create_engine_config()
-    return Speculation(RejectionSampler(Sampler()), NgramProposer(config))
+    return Speculation(RejectionSampler(Sampler()), Ngram.of(config))
 
 
 @pytest.mark.usefixtures("platform_env")
