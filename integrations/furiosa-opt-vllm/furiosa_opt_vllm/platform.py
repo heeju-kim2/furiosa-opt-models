@@ -4,7 +4,7 @@ does not serve."""
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, final
+from typing import TYPE_CHECKING, Final, final
 
 import torch
 from pydantic import ValidationError
@@ -32,6 +32,10 @@ if TYPE_CHECKING:
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
 
+# vLLM-Omni stage architectures whose runner draws each token on the host from the engine's scores.
+HOST_SAMPLED: Final = frozenset({"Qwen3TTSTalkerForConditionalGeneration"})
+
+
 @final
 class FuriosaPlatform(Platform):
     """vLLM platform for RNGD: host tensors, the plugin worker and no attention backend."""
@@ -46,6 +50,8 @@ class FuriosaPlatform(Platform):
     ray_device_key: str = ""
     # The runtime's mask of the chips a process may open, which vLLM's local ranks index.
     device_control_env_var: str = "FURIOSA_VISIBLE_CHIPS"
+    # Whether a configured model's runner samples on the host, which admits sampled requests.
+    host_sampled: bool = False
 
     @classmethod
     @override
@@ -94,6 +100,8 @@ class FuriosaPlatform(Platform):
         # vLLM's ngram proposer runs numba, whose OpenMP layer resizes that pool to numba's thread
         # count, every CPU by default, on which each later sampling kernel waits for busy cores.
         os.environ.setdefault("NUMBA_NUM_THREADS", str(torch.get_num_threads()))
+        if model_config and set(model_config.architectures or ()) & HOST_SAMPLED:
+            cls.host_sampled = True
         if model_config:
             recurrent_state(model_config, vllm_config.cache_config)
             verify_checkpoint(model_config, vllm_config.load_config, "model", options(vllm_config))
@@ -175,12 +183,15 @@ class FuriosaPlatform(Platform):
     def validate_request(
         cls, processed_inputs: EngineInput, params: SamplingParams | PoolingParams
     ) -> None:
-        # The engine's calls take token IDs and return each row's greedy token, not its scores.
+        # The engine's calls take token IDs and return each row's greedy token, not its scores; a
+        # host-sampled stage's runner draws from the scores with the parameters it reads.
         from vllm.sampling_params import SamplingParams
 
-        from furiosa_opt_vllm.generation import greedy
+        from furiosa_opt_vllm.admission import greedy, sampled
 
-        if isinstance(params, SamplingParams) and not greedy(params):
+        if isinstance(params, SamplingParams) and not (
+            greedy(params) or (cls.host_sampled and sampled(params))
+        ):
             raise Refused(
                 "sampling_params", "serves only greedy decoding, without logprobs or logit changes"
             )

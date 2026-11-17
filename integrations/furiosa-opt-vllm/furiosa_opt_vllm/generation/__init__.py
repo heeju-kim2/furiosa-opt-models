@@ -14,19 +14,18 @@ from typing import TYPE_CHECKING, assert_never, final
 
 import torch
 from typing_extensions import override
-from vllm.sampling_params import SamplingType
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
 from vllm.v1.sample.logits_processor import BUILTIN_LOGITS_PROCESSORS
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 
+from furiosa_opt_vllm.admission import greedy
 from furiosa_opt_vllm.device import read
 from furiosa_opt_vllm.replay import Replay
 from furiosa_opt_vllm.runner import Argmax, Logits, Runner, Tokens
 from furiosa_opt_vllm.selection import Sampling, Speculation
 
 if TYPE_CHECKING:
-    from vllm.sampling_params import SamplingParams
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.outputs import KVConnectorOutput, LogprobsLists, SamplingMaskLists
     from vllm.v1.worker.gpu_input_batch import CachedRequestState
@@ -120,27 +119,6 @@ def flush(runner: Runner) -> None:
     """Read every issued step's tokens to the host, for a step that needs them there."""
     for issued in list(runner.issued):
         _ = issued.get_output()
-
-
-def greedy(params: SamplingParams) -> bool:
-    return (
-        params.sampling_type == SamplingType.GREEDY
-        and params.logprobs is None
-        and params.prompt_logprobs is None
-        and params.prompt_logprob_token_ids is None
-        and params.logprob_token_ids is None
-        and params.thinking_token_budget is None
-        and params.repetition_penalty == 1
-        and params.frequency_penalty == 0
-        and params.presence_penalty == 0
-        and params.min_tokens == 0
-        and not params.logit_bias
-        and not params.allowed_token_ids
-        and not params.bad_words
-        and params.structured_outputs is None
-        and params.trace_decode_token_ids is None
-        and not params.extra_args
-    )
 
 
 def sample(

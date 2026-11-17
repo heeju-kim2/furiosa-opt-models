@@ -1,4 +1,5 @@
-"""vLLM-Omni platform that hands diffusion pipelines to the engine, which refuses each one."""
+"""vLLM-Omni platform of the engine: Qwen3-TTS's talker and code2wav stages run on its workers, and
+diffusion pipelines go to the engine, which refuses each one."""
 
 from typing import final
 
@@ -12,6 +13,18 @@ from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 @final
 class Platform(OmniPlatform, CpuPlatform):
     _omni_enum = OmniPlatformEnum.OOT
+    # A stage's `devices` name the chips its worker opens, as the vLLM platform's do.
+    device_control_env_var: str = "FURIOSA_VISIBLE_CHIPS"
+
+    @classmethod
+    @override
+    def get_omni_ar_worker_cls(cls) -> str:
+        return "furiosa_opt_vllm.omni.talker.Worker"
+
+    @classmethod
+    @override
+    def get_omni_generation_worker_cls(cls) -> str:
+        return "furiosa_opt_vllm.omni.code2wav.Worker"
 
     @classmethod
     @override

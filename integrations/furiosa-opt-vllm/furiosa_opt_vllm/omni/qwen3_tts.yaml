@@ -1,0 +1,52 @@
+# Qwen3-TTS on RNGD: the talker stage, then the code2wav stage, each on a chip of its own, the
+# frames passed whole through shared memory once the talker finishes (no async chunks).
+model_runner: v1
+async_chunk: false
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait: 300
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    async_scheduling: false
+    enforce_eager: true
+    enable_prefix_caching: false
+    block_size: 16
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    trust_remote_code: true
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    # Official qwen-tts's draws; the talker runner holds the codec's end back for two frames.
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      repetition_penalty: 1.05
+      max_tokens: 4096
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 8
+    async_scheduling: false
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    trust_remote_code: true
+    devices: "1"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 65536
+platforms:
+  cpu:
+    model_runner: v1

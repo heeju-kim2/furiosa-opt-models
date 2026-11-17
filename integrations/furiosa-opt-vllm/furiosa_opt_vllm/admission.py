@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         SpeculativeConfig,
         VllmConfig,
     )
+    from vllm.sampling_params import SamplingParams
 
     import furiosa_opt_engine as engine
     from furiosa_opt_vllm.additional import Placement, Section
@@ -648,3 +649,49 @@ def speculative(config: VllmConfig, section: Section) -> Speculative | None:
             return Draft.parse(config, settings, section)
         case _:
             assert_never(method)
+
+
+# Imported here, not with the samplers, so a request's check imports no proposer.
+def sampled(params: SamplingParams) -> bool:
+    """Whether `params` ask only for what a host-sampled runner draws with: its temperature, top-k,
+    top-p, repetition penalty, minimum tokens and seed, without logprobs or other logit changes."""
+    return (
+        params.logprobs is None
+        and params.prompt_logprobs is None
+        and params.prompt_logprob_token_ids is None
+        and params.logprob_token_ids is None
+        and params.thinking_token_budget is None
+        and params.frequency_penalty == 0
+        and params.presence_penalty == 0
+        and params.min_p == 0
+        and not params.logit_bias
+        and not params.allowed_token_ids
+        and not params.bad_words
+        and params.structured_outputs is None
+        and params.trace_decode_token_ids is None
+        and not params.extra_args
+    )
+
+
+def greedy(params: SamplingParams) -> bool:
+    """Whether `params` ask for the greedy token alone, which an engine call selects."""
+    from vllm.sampling_params import SamplingType
+
+    return (
+        params.sampling_type == SamplingType.GREEDY
+        and params.logprobs is None
+        and params.prompt_logprobs is None
+        and params.prompt_logprob_token_ids is None
+        and params.logprob_token_ids is None
+        and params.thinking_token_budget is None
+        and params.repetition_penalty == 1
+        and params.frequency_penalty == 0
+        and params.presence_penalty == 0
+        and params.min_tokens == 0
+        and not params.logit_bias
+        and not params.allowed_token_ids
+        and not params.bad_words
+        and params.structured_outputs is None
+        and params.trace_decode_token_ids is None
+        and not params.extra_args
+    )
